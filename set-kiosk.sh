@@ -7,7 +7,8 @@
 # PREREQUISITES (must already be true before running):
 #   - Arch is installed and booted
 #   - Internet works (ping archlinux.org)
-#   - Your Flutter app's release bundle is available somewhere (set APP_SRC)
+#   - Your Flutter app is available as a git repo (default) or local folder
+#     (configured via APP_REPO / APP_SRC below)
 #
 # The admin (sudo) user is created automatically if it doesn't exist yet —
 # you'll be prompted to set its password once.
@@ -26,9 +27,14 @@ set -euo pipefail
 ADMIN_USER="admin"          # your existing sudo user
 KIOSK_USER="kiosk"          # the locked-down user (created by this script)
 
-# Where your built Flutter Linux app lives RIGHT NOW (the release bundle folder).
-# Leave empty ("") if you have ALREADY put your app in /opt/hybridController yourself.
-APP_SRC="/home/${ADMIN_USER}/hybridController"
+# ---- Where your Flutter app comes from -------------------------------------
+# Option 1 (default): clone the app bundle from a git repo.
+APP_REPO="https://github.com/zVoid24/modbus_linux_bundle.git"
+
+# Option 2: use a local folder already on disk instead of git.
+#   Leave APP_REPO="" and set APP_SRC to the bundle folder path.
+#   If BOTH are empty, the script assumes you already put the app in APP_DIR.
+APP_SRC=""
 
 # Name of your Flutter executable inside the bundle (the binary, not a .sh):
 APP_BINARY="modbus"
@@ -68,13 +74,30 @@ if ! id "$ADMIN_USER" &>/dev/null; then
     echo ""
     echo "  Set a password for the new admin user '$ADMIN_USER'"
     echo "  (you'll use this for F12 -> Admin Login and all sudo/remote admin):"
-    while ! passwd "$ADMIN_USER"; do
-        warn "Password not set, try again."
+
+    # try up to 3 times, then bail out with clear instructions instead of
+    # looping forever (an unwritable/half-created state can make passwd always fail)
+    pw_ok=0
+    for _try in 1 2 3; do
+        if passwd "$ADMIN_USER"; then pw_ok=1; break; fi
+        warn "passwd failed (attempt $_try/3)."
     done
+    if [[ $pw_ok -ne 1 ]]; then
+        echo ""
+        warn "Could not set the admin password automatically."
+        warn "Open ANOTHER terminal / TTY, run:   passwd $ADMIN_USER"
+        warn "set the password there, then re-run this script (it will skip creation)."
+        die "Stopping so you can set the password manually."
+    fi
 else
     echo "Admin user '$ADMIN_USER' already exists."
     # make sure it's actually in wheel (so it has sudo)
     usermod -aG wheel "$ADMIN_USER"
+    # if it somehow has no password set, prompt once (but don't loop forever)
+    if ! passwd -S "$ADMIN_USER" 2>/dev/null | grep -qE ' (P|PS) '; then
+        warn "Admin '$ADMIN_USER' has no password set. Set one now:"
+        passwd "$ADMIN_USER" || warn "Password still not set — set it manually with: passwd $ADMIN_USER"
+    fi
 fi
 
 # ============================================================================
@@ -139,15 +162,25 @@ gpasswd -d "$KIOSK_USER" wheel 2>/dev/null || true
 # ============================================================================
 say "STEP 5/13  Deploying the Flutter app to $APP_DIR"
 mkdir -p "$APP_DIR"
-if [[ -n "$APP_SRC" ]]; then
+if [[ -n "$APP_REPO" ]]; then
+    # clone the bundle from git into a temp dir, then copy its contents in
+    TMP_CLONE="$(mktemp -d)"
+    echo "Cloning app from $APP_REPO ..."
+    git clone --depth 1 "$APP_REPO" "$TMP_CLONE" || die "git clone failed: $APP_REPO"
+    # copy everything except the .git folder
+    (shopt -s dotglob; cp -r "$TMP_CLONE"/* "$APP_DIR"/ 2>/dev/null || true)
+    rm -rf "$APP_DIR/.git" "$TMP_CLONE"
+    echo "Deployed app from repo."
+elif [[ -n "$APP_SRC" ]]; then
     [[ -d "$APP_SRC" ]] || die "APP_SRC '$APP_SRC' not found. Fix the path at the top of this script."
     cp -r "${APP_SRC}/." "$APP_DIR/"
     echo "Copied app from $APP_SRC"
 else
-    warn "APP_SRC empty — assuming you already placed the app in $APP_DIR."
+    warn "APP_REPO and APP_SRC both empty — assuming you already placed the app in $APP_DIR."
 fi
 chown -R root:root "$APP_DIR"
 chmod -R 755 "$APP_DIR"
+chmod +x "${APP_DIR}/${APP_BINARY}" 2>/dev/null || true
 [[ -x "${APP_DIR}/${APP_BINARY}" ]] || warn "Binary ${APP_DIR}/${APP_BINARY} not found/executable — check APP_BINARY."
 
 # ============================================================================
