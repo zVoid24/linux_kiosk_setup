@@ -57,17 +57,7 @@ die()  { echo -e "\033[1;31mERROR: $*\033[0m"; exit 1; }
 
 # ---- sanity checks ---------------------------------------------------------
 [[ $EUID -eq 0 ]] || die "Run with sudo:  sudo ./setup-kiosk.sh   (or as root)"
-
-# Internet check: try several reliable hosts; pass if ANY responds. Don't hinge
-# on a single domain (some networks block specific ones) or on NetworkManager
-# (this box may use systemd-networkd / static config instead).
-net_ok=0
-for host in archlinux.org google.com 1.1.1.1 8.8.8.8; do
-    if ping -c1 -W3 "$host" &>/dev/null; then net_ok=1; break; fi
-done
-if [[ $net_ok -ne 1 ]]; then
-    die "No internet reachable. Connect first, then re-run. (You can also test with: ping google.com)"
-fi
+ping -c1 -W3 archlinux.org &>/dev/null || die "No internet. Connect first (nmcli / systemctl start NetworkManager)."
 
 KIOSK_HOME="/home/${KIOSK_USER}"
 
@@ -312,7 +302,7 @@ choice=$(printf "Restart App\nRustDesk\nChrome\nFile Manager\nTerminal\nAdmin Lo
 case "$choice" in
   "Restart App")   systemctl --user restart kiosk-app.service ;;
   "RustDesk")      rustdesk & ;;
-  "Chrome")        /usr/local/bin/kiosk-chromium & ;;
+  "Chrome")        chromium & ;;
   "File Manager")  pcmanfm & ;;
   "Terminal")      xterm & ;;
   "Admin Login")   xterm -e "su - ADMIN_PLACEHOLDER" & ;;
@@ -323,28 +313,6 @@ sed -i "s/ADMIN_PLACEHOLDER/${ADMIN_USER}/" /usr/local/bin/kiosk-menu
 chmod 755 /usr/local/bin/kiosk-menu
 chown root:root /usr/local/bin/kiosk-menu
 
-# Self-healing Chromium launcher. Runs as the kiosk user (F12 menu context) and
-# keeps ALL Chromium data (profile + cache + crashpad database) inside a folder
-# in the kiosk's OWN home, created fresh at launch if missing. This sidesteps
-# every ~/.config / ~/.cache ownership problem permanently: even if setup left
-# those dirs wrong, Chrome still works because it never touches them.
-cat > /usr/local/bin/kiosk-chromium <<'EOF'
-#!/bin/bash
-DATA="${HOME}/chromium-data"
-mkdir -p "$DATA/cache"
-exec chromium \
-    --user-data-dir="$DATA" \
-    --disk-cache-dir="$DATA/cache" \
-    --no-first-run \
-    --no-default-browser-check \
-    "$@"
-EOF
-chmod 755 /usr/local/bin/kiosk-chromium
-chown root:root /usr/local/bin/kiosk-chromium
-# make sure the data dir exists and is kiosk-owned up front too
-mkdir -p "${KIOSK_HOME}/chromium-data/cache"
-chown -R "${KIOSK_USER}:${KIOSK_USER}" "${KIOSK_HOME}/chromium-data"
-
 # allow kiosk to run ONLY reboot with sudo
 echo "${KIOSK_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl reboot" > /etc/sudoers.d/kiosk-reboot
 chmod 440 /etc/sudoers.d/kiosk-reboot
@@ -353,7 +321,7 @@ visudo -cf /etc/sudoers.d/kiosk-reboot >/dev/null || die "sudoers rule invalid"
 # ============================================================================
 say "STEP 12/13  RustDesk background service (unkillable, auto-restart)"
 # enable whatever the service is actually called
-RD_UNIT=$(systemctl list-unit-files | awk '/rustdesk/{print $1; exit}')
+RD_UNIT=$(systemctl list-unit-files 2>/dev/null | awk '/rustdesk/{print $1}' | head -n1 || true)
 if [[ -n "${RD_UNIT:-}" ]]; then
     systemctl enable "$RD_UNIT"
     mkdir -p "/etc/systemd/system/${RD_UNIT}.d"
@@ -398,6 +366,10 @@ done
 # the whole ~/.cache belongs to kiosk (chromium writes lots of subdirs there)
 chown -R "${KIOSK_USER}:${KIOSK_USER}" "${KIOSK_HOME}/.cache"
 chmod 755 "${KIOSK_HOME}/.cache"
+
+mkdir -p /home/kiosk/.config/chromium /home/kiosk/.cache/chromium
+chown -R kiosk:kiosk /home/kiosk/.config/chromium /home/kiosk/.cache
+chmod -R 755 /home/kiosk/.config/chromium /home/kiosk/.cache
 
 # verify chromium can actually write its dirs (fail loudly if not)
 if ! sudo -u "$KIOSK_USER" test -w "${KIOSK_HOME}/.config/chromium" \
@@ -444,7 +416,7 @@ NEWNAME="$1"
 echo "==> hostname -> $NEWNAME"; hostnamectl set-hostname "$NEWNAME"
 echo "==> regenerating machine-id"; rm -f /etc/machine-id; systemd-machine-id-setup
 echo "==> resetting RustDesk ID"
-RD=$(systemctl list-unit-files | awk '/rustdesk/{print $1; exit}')
+RD=$(systemctl list-unit-files 2>/dev/null | awk '/rustdesk/{print $1}' | head -n1 || true)
 [[ -n "$RD" ]] && systemctl stop "$RD"
 rm -f /root/.config/rustdesk/RustDesk*.toml
 [[ -n "$RD" ]] && systemctl start "$RD"; sleep 3
