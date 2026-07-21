@@ -25,13 +25,13 @@ KIOSK_USER="kiosk"          # the locked-down user (created by this script)
 
 # Where your built Flutter Linux app lives RIGHT NOW (the release bundle folder).
 # Leave empty ("") if you have ALREADY put your app in /opt/myapp yourself.
-APP_SRC="/home/${ADMIN_USER}/hybridController"
+APP_SRC="/home/${ADMIN_USER}/myapp-bundle"
 
 # Name of your Flutter executable inside the bundle (the binary, not a .sh):
-APP_BINARY="modbus"
+APP_BINARY="myapp"
 
 # Install location (do not usually need to change):
-APP_DIR="/opt/hybridController"
+APP_DIR="/opt/myapp"
 ##############################################################################
 
 # ---- helpers ---------------------------------------------------------------
@@ -132,6 +132,13 @@ EOF
 say "STEP 8/13  Writing .xinitrc (starts app service + gives root display access for RustDesk)"
 cat > "${KIOSK_HOME}/.xinitrc" <<'EOF'
 #!/bin/bash
+# Tell apps this is an X11 session. Because we start X with startx (no display
+# manager), XDG_SESSION_TYPE is otherwise empty and RustDesk reports
+# "Unsupported display server tty, x11 expected". These exports fix that.
+export XDG_SESSION_TYPE=x11
+export XDG_SESSION_DESKTOP=openbox
+export XDG_CURRENT_DESKTOP=openbox
+
 # Disable screen blanking / power saving
 xset s off
 xset -dpms
@@ -140,8 +147,8 @@ xset s noblank
 # Let the RustDesk root service access this X session
 xhost +si:localuser:root
 
-# Hand systemd user services the display info, then start the app
-systemctl --user import-environment DISPLAY XAUTHORITY
+# Hand systemd user services the display + session info, then start the app
+systemctl --user import-environment DISPLAY XAUTHORITY XDG_SESSION_TYPE XDG_SESSION_DESKTOP XDG_CURRENT_DESKTOP
 systemctl --user start kiosk-app.service
 
 # Openbox is the session (must be last)
@@ -238,22 +245,36 @@ fi
 # ============================================================================
 say "STEP 13/13  Pre-creating writable app-config dirs, then LOCKING everything down"
 
-# writable sandboxes so chromium / pcmanfm don't crash on first launch
-for d in chromium pcmanfm libfm gtk-3.0 dconf; do
-    mkdir -p "${KIOSK_HOME}/.config/${d}"
+# Writable sandboxes so chromium / pcmanfm don't crash on first launch.
+# IMPORTANT: chromium needs BOTH ~/.config/chromium (profile) AND
+# ~/.cache/chromium (crashpad database) — a missing ~/.cache/chromium is the
+# "chrome_crashpad_handler: --database is required" error.
+CFG_DIRS=(chromium pcmanfm libfm gtk-3.0 dconf)
+CACHE_DIRS=(chromium)
+
+# create as the kiosk user so ownership is correct from the start
+for d in "${CFG_DIRS[@]}"; do
+    sudo -u "$KIOSK_USER" mkdir -p "${KIOSK_HOME}/.config/${d}"
 done
-chown -R "${KIOSK_USER}:${KIOSK_USER}" \
-    "${KIOSK_HOME}/.config/chromium" \
-    "${KIOSK_HOME}/.config/pcmanfm" \
-    "${KIOSK_HOME}/.config/libfm" \
-    "${KIOSK_HOME}/.config/gtk-3.0" \
-    "${KIOSK_HOME}/.config/dconf"
-chmod -R 755 \
-    "${KIOSK_HOME}/.config/chromium" \
-    "${KIOSK_HOME}/.config/pcmanfm" \
-    "${KIOSK_HOME}/.config/libfm" \
-    "${KIOSK_HOME}/.config/gtk-3.0" \
-    "${KIOSK_HOME}/.config/dconf"
+for d in "${CACHE_DIRS[@]}"; do
+    sudo -u "$KIOSK_USER" mkdir -p "${KIOSK_HOME}/.cache/${d}"
+done
+
+# belt-and-suspenders: force correct ownership/perms regardless of prior state
+chown -R "${KIOSK_USER}:${KIOSK_USER}" "${KIOSK_HOME}/.cache"
+for d in "${CFG_DIRS[@]}"; do
+    chown -R "${KIOSK_USER}:${KIOSK_USER}" "${KIOSK_HOME}/.config/${d}"
+    chmod -R 755 "${KIOSK_HOME}/.config/${d}"
+done
+chmod 755 "${KIOSK_HOME}/.cache"
+
+# verify chromium can actually write its dirs (fail loudly if not)
+if ! sudo -u "$KIOSK_USER" test -w "${KIOSK_HOME}/.config/chromium" \
+   || ! sudo -u "$KIOSK_USER" test -w "${KIOSK_HOME}/.cache/chromium"; then
+    warn "Chromium dirs are not writable by ${KIOSK_USER} — Chrome may fail. Check ${KIOSK_HOME}/.config/chromium and ${KIOSK_HOME}/.cache/chromium ownership."
+else
+    echo "Chromium profile + cache dirs writable by ${KIOSK_USER}. Good."
+fi
 
 # lock the kiosk-owned config that must NOT be editable/deletable
 chown root:root "${KIOSK_HOME}/.bash_profile" "${KIOSK_HOME}/.xinitrc"
