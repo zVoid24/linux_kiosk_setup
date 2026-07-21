@@ -6,13 +6,16 @@
 #
 # PREREQUISITES (must already be true before running):
 #   - Arch is installed and booted
-#   - A sudo user 'admin' exists (or set ADMIN_USER below)
 #   - Internet works (ping archlinux.org)
 #   - Your Flutter app's release bundle is available somewhere (set APP_SRC)
 #
-# RUN IT LIKE THIS (as the admin user):
+# The admin (sudo) user is created automatically if it doesn't exist yet —
+# you'll be prompted to set its password once.
+#
+# RUN IT LIKE THIS (as root on a fresh install, or via sudo):
 #   chmod +x setup-kiosk.sh
-#   sudo ./setup-kiosk.sh
+#   ./setup-kiosk.sh          # if logged in as root
+#   sudo ./setup-kiosk.sh     # if logged in as an existing sudo user
 #
 # Everything is idempotent-ish: safe to re-run if something fails midway.
 ###############################################################################
@@ -40,12 +43,39 @@ warn() { echo -e "\033[1;33m!!  $*\033[0m"; }
 die()  { echo -e "\033[1;31mERROR: $*\033[0m"; exit 1; }
 
 # ---- sanity checks ---------------------------------------------------------
-[[ $EUID -eq 0 ]] || die "Run with sudo:  sudo ./setup-kiosk.sh"
-[[ -n "${SUDO_USER:-}" ]] || die "Run via sudo from your admin account, not as raw root."
-id "$ADMIN_USER" &>/dev/null || die "Admin user '$ADMIN_USER' does not exist. Create it first."
+[[ $EUID -eq 0 ]] || die "Run with sudo:  sudo ./setup-kiosk.sh   (or as root)"
 ping -c1 -W3 archlinux.org &>/dev/null || die "No internet. Connect first (nmcli / systemctl start NetworkManager)."
 
 KIOSK_HOME="/home/${KIOSK_USER}"
+
+# ---- ensure the admin (sudo) user exists -----------------------------------
+# The AUR builds (yay, rustdesk) must run as a NON-root user with sudo, because
+# makepkg refuses to run as root. So we guarantee $ADMIN_USER exists and has sudo.
+say "STEP 0/13  Ensuring admin user '$ADMIN_USER' exists with sudo"
+
+# make sure sudo + the wheel sudoers rule are in place
+pacman -S --needed --noconfirm sudo
+# enable sudo for the wheel group (idempotent)
+if ! grep -q '^%wheel ALL=(ALL:ALL) ALL' /etc/sudoers 2>/dev/null; then
+    echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/10-wheel
+    chmod 440 /etc/sudoers.d/10-wheel
+    visudo -cf /etc/sudoers.d/10-wheel >/dev/null || die "wheel sudoers rule invalid"
+fi
+
+if ! id "$ADMIN_USER" &>/dev/null; then
+    warn "Admin user '$ADMIN_USER' does not exist — creating it now."
+    useradd -m -G wheel -s /bin/bash "$ADMIN_USER"
+    echo ""
+    echo "  Set a password for the new admin user '$ADMIN_USER'"
+    echo "  (you'll use this for F12 -> Admin Login and all sudo/remote admin):"
+    while ! passwd "$ADMIN_USER"; do
+        warn "Password not set, try again."
+    done
+else
+    echo "Admin user '$ADMIN_USER' already exists."
+    # make sure it's actually in wheel (so it has sudo)
+    usermod -aG wheel "$ADMIN_USER"
+fi
 
 # ============================================================================
 say "STEP 1/13  Installing official packages"
@@ -57,9 +87,19 @@ pacman -S --needed --noconfirm \
 
 # ============================================================================
 say "STEP 2/13  Ensuring yay (AUR helper) is installed"
+
+# makepkg runs 'sudo pacman' internally to install built packages. Since this
+# script runs unattended, grant admin TEMPORARY passwordless sudo for the build,
+# then revoke it at the end of STEP 3.
+TMP_SUDO="/etc/sudoers.d/00-kiosk-build-temp"
+echo "${ADMIN_USER} ALL=(ALL) NOPASSWD: ALL" > "$TMP_SUDO"
+chmod 440 "$TMP_SUDO"
+cleanup_tmp_sudo() { rm -f "$TMP_SUDO"; }
+trap cleanup_tmp_sudo EXIT
+
 if ! command -v yay &>/dev/null; then
-    warn "yay not found — building it as $SUDO_USER"
-    sudo -u "$SUDO_USER" bash -c '
+    warn "yay not found — building it as $ADMIN_USER"
+    sudo -u "$ADMIN_USER" bash -c '
         set -e
         cd /tmp
         rm -rf yay-bin
@@ -74,10 +114,14 @@ fi
 # ============================================================================
 say "STEP 3/13  Installing RustDesk (from AUR)"
 if ! command -v rustdesk &>/dev/null; then
-    sudo -u "$SUDO_USER" yay -S --noconfirm rustdesk-bin
+    sudo -u "$ADMIN_USER" yay -S --noconfirm rustdesk-bin
 else
     echo "rustdesk already present."
 fi
+
+# revoke the temporary passwordless sudo now that AUR builds are done
+cleanup_tmp_sudo
+trap - EXIT
 
 # ============================================================================
 say "STEP 4/13  Creating locked-down kiosk user"
