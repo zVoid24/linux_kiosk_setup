@@ -27,6 +27,13 @@ set -euo pipefail
 ADMIN_USER="admin"          # your existing sudo user
 KIOSK_USER="kiosk"          # the locked-down user (created by this script)
 
+# Kiosk user's password. The kiosk auto-logs in so it's never typed at login,
+# BUT some dialogs (polkit auth, screen prompts, su - kiosk) can ask for it,
+# so a KNOWN password is more practical than a random one.
+#   - Leave "" to be PROMPTED for it during setup (recommended).
+#   - Or hardcode one here for fully non-interactive installs, e.g. "kiosk1234".
+KIOSK_PASSWORD=""
+
 # ---- Where your Flutter app comes from -------------------------------------
 # Option 1 (default): clone the app bundle from a git repo.
 APP_REPO="https://github.com/zVoid24/modbus_linux_bundle.git"
@@ -150,14 +157,25 @@ trap - EXIT
 say "STEP 4/13  Creating locked-down kiosk user"
 if ! id "$KIOSK_USER" &>/dev/null; then
     useradd -m -s /bin/bash "$KIOSK_USER"
-    # random locked password; autologin bypasses it anyway
-    echo "${KIOSK_USER}:$(openssl rand -base64 12)" | chpasswd
     echo "Created user '$KIOSK_USER' (NOT in wheel group -> no sudo)."
-else
-    echo "User '$KIOSK_USER' already exists."
 fi
 # make absolutely sure kiosk has no sudo
 gpasswd -d "$KIOSK_USER" wheel 2>/dev/null || true
+
+# set the kiosk password: use KIOSK_PASSWORD if provided, else prompt.
+# A KNOWN password matters because polkit / su / screen dialogs may ask for it.
+if [[ -n "$KIOSK_PASSWORD" ]]; then
+    echo "${KIOSK_USER}:${KIOSK_PASSWORD}" | chpasswd
+    echo "Kiosk password set from config."
+elif [[ -t 0 ]]; then
+    echo ""
+    echo "  Set a password for the kiosk user (you may need it for polkit / su prompts):"
+    passwd "$KIOSK_USER" || warn "Kiosk password not set — set later with: sudo passwd $KIOSK_USER"
+else
+    # non-interactive (e.g. curl | bash) and no KIOSK_PASSWORD given -> sane default
+    echo "${KIOSK_USER}:kiosk" | chpasswd
+    warn "No KIOSK_PASSWORD set and running non-interactively — defaulted kiosk password to 'kiosk'. CHANGE IT with: sudo passwd $KIOSK_USER"
+fi
 
 # ============================================================================
 say "STEP 5/13  Deploying the Flutter app to $APP_DIR"
@@ -326,29 +344,34 @@ say "STEP 13/13  Pre-creating writable app-config dirs, then LOCKING everything 
 # IMPORTANT: chromium needs BOTH ~/.config/chromium (profile) AND
 # ~/.cache/chromium (crashpad database) — a missing ~/.cache/chromium is the
 # "chrome_crashpad_handler: --database is required" error.
+#
+# NOTE: earlier steps created ~/.config (via systemd/openbox) as ROOT, so the
+# kiosk user CANNOT mkdir inside it. We therefore create every dir as ROOT here,
+# then hand ownership of the app dirs back to kiosk.
 CFG_DIRS=(chromium pcmanfm libfm gtk-3.0 dconf)
 CACHE_DIRS=(chromium)
 
-# create as the kiosk user so ownership is correct from the start
-for d in "${CFG_DIRS[@]}"; do
-    sudo -u "$KIOSK_USER" mkdir -p "${KIOSK_HOME}/.config/${d}"
-done
-for d in "${CACHE_DIRS[@]}"; do
-    sudo -u "$KIOSK_USER" mkdir -p "${KIOSK_HOME}/.cache/${d}"
-done
+# make sure the home + base dirs exist and belong to kiosk
+mkdir -p "${KIOSK_HOME}/.config" "${KIOSK_HOME}/.cache"
 
-# belt-and-suspenders: force correct ownership/perms regardless of prior state
-chown -R "${KIOSK_USER}:${KIOSK_USER}" "${KIOSK_HOME}/.cache"
+# create all writable subdirs AS ROOT (always works), then chown to kiosk
 for d in "${CFG_DIRS[@]}"; do
+    mkdir -p "${KIOSK_HOME}/.config/${d}"
     chown -R "${KIOSK_USER}:${KIOSK_USER}" "${KIOSK_HOME}/.config/${d}"
     chmod -R 755 "${KIOSK_HOME}/.config/${d}"
 done
+for d in "${CACHE_DIRS[@]}"; do
+    mkdir -p "${KIOSK_HOME}/.cache/${d}"
+done
+# the whole ~/.cache belongs to kiosk (chromium writes lots of subdirs there)
+chown -R "${KIOSK_USER}:${KIOSK_USER}" "${KIOSK_HOME}/.cache"
 chmod 755 "${KIOSK_HOME}/.cache"
 
 # verify chromium can actually write its dirs (fail loudly if not)
 if ! sudo -u "$KIOSK_USER" test -w "${KIOSK_HOME}/.config/chromium" \
    || ! sudo -u "$KIOSK_USER" test -w "${KIOSK_HOME}/.cache/chromium"; then
-    warn "Chromium dirs are not writable by ${KIOSK_USER} — Chrome may fail. Check ${KIOSK_HOME}/.config/chromium and ${KIOSK_HOME}/.cache/chromium ownership."
+    warn "Chromium dirs are NOT writable by ${KIOSK_USER} — Chrome will fail!"
+    warn "Check ownership of ${KIOSK_HOME}/.config/chromium and ${KIOSK_HOME}/.cache/chromium"
 else
     echo "Chromium profile + cache dirs writable by ${KIOSK_USER}. Good."
 fi
