@@ -389,6 +389,17 @@ find "${KIOSK_HOME}/.config/openbox" "${KIOSK_HOME}/.config/systemd" -type f -ex
 chown root:root "${KIOSK_HOME}/.config"
 chmod 755       "${KIOSK_HOME}/.config"
 
+# ---------------------------------------------------------------------------
+# FINAL Chromium fix — run LAST so nothing above can undo it.
+# These are the exact commands confirmed to make Chrome work on a real kiosk:
+#   the profile (~/.config/chromium) and crashpad DB (~/.cache/chromium) must
+#   exist and be kiosk-owned. Hardcoded here so a fresh install never needs a
+#   manual fixup.
+mkdir -p "${KIOSK_HOME}/.config/chromium" "${KIOSK_HOME}/.cache/chromium"
+chown -R "${KIOSK_USER}:${KIOSK_USER}" "${KIOSK_HOME}/.config/chromium" "${KIOSK_HOME}/.cache"
+chmod -R 755 "${KIOSK_HOME}/.config/chromium" "${KIOSK_HOME}/.cache"
+echo "Chromium profile + cache dirs created and owned by ${KIOSK_USER}."
+
 # ============================================================================
 say "Installing the per-device first-setup helper (for cloned machines)"
 cat > /usr/local/bin/first-setup <<'EOF'
