@@ -367,6 +367,10 @@ done
 chown -R "${KIOSK_USER}:${KIOSK_USER}" "${KIOSK_HOME}/.cache"
 chmod 755 "${KIOSK_HOME}/.cache"
 
+mkdir -p /home/kiosk/.config/chromium /home/kiosk/.cache/chromium
+chown -R kiosk:kiosk /home/kiosk/.config/chromium /home/kiosk/.cache
+chmod -R 755 /home/kiosk/.config/chromium /home/kiosk/.cache
+
 # verify chromium can actually write its dirs (fail loudly if not)
 if ! sudo -u "$KIOSK_USER" test -w "${KIOSK_HOME}/.config/chromium" \
    || ! sudo -u "$KIOSK_USER" test -w "${KIOSK_HOME}/.cache/chromium"; then
