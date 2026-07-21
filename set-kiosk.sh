@@ -24,14 +24,14 @@ ADMIN_USER="admin"          # your existing sudo user
 KIOSK_USER="kiosk"          # the locked-down user (created by this script)
 
 # Where your built Flutter Linux app lives RIGHT NOW (the release bundle folder).
-# Leave empty ("") if you have ALREADY put your app in /opt/myapp yourself.
-APP_SRC="/home/${ADMIN_USER}/myapp-bundle"
+# Leave empty ("") if you have ALREADY put your app in /opt/hybridController yourself.
+APP_SRC="/home/${ADMIN_USER}/hybridController"
 
 # Name of your Flutter executable inside the bundle (the binary, not a .sh):
-APP_BINARY="myapp"
+APP_BINARY="modbus"
 
 # Install location (do not usually need to change):
-APP_DIR="/opt/myapp"
+APP_DIR="/opt/hybridController"
 ##############################################################################
 
 # ---- helpers ---------------------------------------------------------------
