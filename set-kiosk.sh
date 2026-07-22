@@ -34,6 +34,15 @@ KIOSK_USER="kiosk"          # the locked-down user (created by this script)
 #   - Or hardcode one here for fully non-interactive installs, e.g. "kiosk1234".
 KIOSK_PASSWORD=""
 
+# ---- Final TTY hardening (do this ONLY on production images) ---------------
+# When "yes", blocks Ctrl+Alt+F-keys (TTY switching) and Ctrl+Alt+Backspace
+# (kill X), so a user at the keyboard cannot escape to a text console.
+#   - Keep "no" while TESTING (so you keep the Ctrl+Alt+F2 escape hatch).
+#   - Set "yes" for the final locked deployment.
+#   WARNING: with "yes", if the GUI ever fails you can only get in via
+#   RustDesk / SSH / bootloader rescue — make sure remote access works first!
+HARDEN_TTY="no"
+
 # ---- Where your Flutter app comes from -------------------------------------
 # Option 1 (default): clone the app bundle from a git repo.
 APP_REPO="https://github.com/zVoid24/modbus_linux_bundle.git"
@@ -57,7 +66,13 @@ die()  { echo -e "\033[1;31mERROR: $*\033[0m"; exit 1; }
 
 # ---- sanity checks ---------------------------------------------------------
 [[ $EUID -eq 0 ]] || die "Run with sudo:  sudo ./setup-kiosk.sh   (or as root)"
-ping -c1 -W3 archlinux.org &>/dev/null || die "No internet. Connect first (nmcli / systemctl start NetworkManager)."
+
+# Internet check: try several reliable hosts; pass if ANY responds.
+net_ok=0
+for host in archlinux.org google.com 1.1.1.1 8.8.8.8; do
+    if ping -c1 -W3 "$host" &>/dev/null; then net_ok=1; break; fi
+done
+[[ $net_ok -eq 1 ]] || die "No internet reachable. Connect first, then re-run. (Test with: ping google.com)"
 
 KIOSK_HOME="/home/${KIOSK_USER}"
 
@@ -320,65 +335,43 @@ visudo -cf /etc/sudoers.d/kiosk-reboot >/dev/null || die "sudoers rule invalid"
 
 # ============================================================================
 say "STEP 12/13  RustDesk background service (unkillable, auto-restart)"
-# enable whatever the service is actually called
+# enable whatever the service is actually called.
+# NOTE: piping systemctl into 'awk ...exit' causes SIGPIPE which, under
+# 'set -o pipefail', returns 141 and would kill the script. So we drop the
+# early exit (awk reads all input) and guard the assignment with '|| true'.
 RD_UNIT=$(systemctl list-unit-files 2>/dev/null | awk '/rustdesk/{print $1}' | head -n1 || true)
 if [[ -n "${RD_UNIT:-}" ]]; then
-    systemctl enable "$RD_UNIT"
+    systemctl enable "$RD_UNIT" || warn "could not enable $RD_UNIT (will still try to configure it)"
     mkdir -p "/etc/systemd/system/${RD_UNIT}.d"
     cat > "/etc/systemd/system/${RD_UNIT}.d/override.conf" <<'EOF'
 [Service]
 Restart=always
 RestartSec=3
 EOF
-    systemctl daemon-reload
+    systemctl daemon-reload || true
     systemctl restart "$RD_UNIT" || true
-    echo "RustDesk service '$RD_UNIT' enabled with Restart=always."
+    echo "RustDesk service '$RD_UNIT' configured with Restart=always."
 else
     warn "No rustdesk systemd unit found. After reboot run RustDesk once, then re-check."
 fi
 
 # ============================================================================
-say "STEP 13/13  Pre-creating writable app-config dirs, then LOCKING everything down"
+say "STEP 13/13  Chromium writable dirs, then LOCKING everything down"
 
-# Writable sandboxes so chromium / pcmanfm don't crash on first launch.
-# IMPORTANT: chromium needs BOTH ~/.config/chromium (profile) AND
-# ~/.cache/chromium (crashpad database) — a missing ~/.cache/chromium is the
-# "chrome_crashpad_handler: --database is required" error.
-#
-# NOTE: earlier steps created ~/.config (via systemd/openbox) as ROOT, so the
-# kiosk user CANNOT mkdir inside it. We therefore create every dir as ROOT here,
-# then hand ownership of the app dirs back to kiosk.
+# Chromium needs writable ~/.config/chromium (profile) AND ~/.cache/chromium
+# (crashpad database). Create as ROOT (works regardless of parent ownership),
+# then chown to kiosk. Other apps get their dirs too.
 CFG_DIRS=(chromium pcmanfm libfm gtk-3.0 dconf)
-CACHE_DIRS=(chromium)
 
-# make sure the home + base dirs exist and belong to kiosk
 mkdir -p "${KIOSK_HOME}/.config" "${KIOSK_HOME}/.cache"
-
-# create all writable subdirs AS ROOT (always works), then chown to kiosk
 for d in "${CFG_DIRS[@]}"; do
     mkdir -p "${KIOSK_HOME}/.config/${d}"
     chown -R "${KIOSK_USER}:${KIOSK_USER}" "${KIOSK_HOME}/.config/${d}"
     chmod -R 755 "${KIOSK_HOME}/.config/${d}"
 done
-for d in "${CACHE_DIRS[@]}"; do
-    mkdir -p "${KIOSK_HOME}/.cache/${d}"
-done
-# the whole ~/.cache belongs to kiosk (chromium writes lots of subdirs there)
+mkdir -p "${KIOSK_HOME}/.cache/chromium"
 chown -R "${KIOSK_USER}:${KIOSK_USER}" "${KIOSK_HOME}/.cache"
 chmod 755 "${KIOSK_HOME}/.cache"
-
-mkdir -p /home/kiosk/.config/chromium /home/kiosk/.cache/chromium
-chown -R kiosk:kiosk /home/kiosk/.config/chromium /home/kiosk/.cache
-chmod -R 755 /home/kiosk/.config/chromium /home/kiosk/.cache
-
-# verify chromium can actually write its dirs (fail loudly if not)
-if ! sudo -u "$KIOSK_USER" test -w "${KIOSK_HOME}/.config/chromium" \
-   || ! sudo -u "$KIOSK_USER" test -w "${KIOSK_HOME}/.cache/chromium"; then
-    warn "Chromium dirs are NOT writable by ${KIOSK_USER} — Chrome will fail!"
-    warn "Check ownership of ${KIOSK_HOME}/.config/chromium and ${KIOSK_HOME}/.cache/chromium"
-else
-    echo "Chromium profile + cache dirs writable by ${KIOSK_USER}. Good."
-fi
 
 # lock the kiosk-owned config that must NOT be editable/deletable
 chown root:root "${KIOSK_HOME}/.bash_profile" "${KIOSK_HOME}/.xinitrc"
@@ -393,16 +386,31 @@ find "${KIOSK_HOME}/.config/openbox" "${KIOSK_HOME}/.config/systemd" -type f -ex
 chown root:root "${KIOSK_HOME}/.config"
 chmod 755       "${KIOSK_HOME}/.config"
 
-# ---------------------------------------------------------------------------
 # FINAL Chromium fix — run LAST so nothing above can undo it.
-# These are the exact commands confirmed to make Chrome work on a real kiosk:
-#   the profile (~/.config/chromium) and crashpad DB (~/.cache/chromium) must
-#   exist and be kiosk-owned. Hardcoded here so a fresh install never needs a
-#   manual fixup.
 mkdir -p "${KIOSK_HOME}/.config/chromium" "${KIOSK_HOME}/.cache/chromium"
 chown -R "${KIOSK_USER}:${KIOSK_USER}" "${KIOSK_HOME}/.config/chromium" "${KIOSK_HOME}/.cache"
 chmod -R 755 "${KIOSK_HOME}/.config/chromium" "${KIOSK_HOME}/.cache"
 echo "Chromium profile + cache dirs created and owned by ${KIOSK_USER}."
+
+# ============================================================================
+# Optional final hardening: block TTY switching + Ctrl+Alt+Backspace.
+# Controlled by HARDEN_TTY at the top. OFF by default so testing keeps the
+# Ctrl+Alt+F2 escape hatch.
+if [[ "$HARDEN_TTY" == "yes" ]]; then
+    say "HARDENING  Blocking TTY switching (DontVTSwitch) + kill-X (DontZap)"
+    mkdir -p /etc/X11/xorg.conf.d
+    cat > /etc/X11/xorg.conf.d/10-kiosk.conf <<'EOF'
+Section "ServerFlags"
+    Option "DontVTSwitch" "true"
+    Option "DontZap"      "true"
+EndSection
+EOF
+    warn "TTY switching is now DISABLED. Admin access = RustDesk / SSH / bootloader rescue only."
+    warn "To undo: sudo rm /etc/X11/xorg.conf.d/10-kiosk.conf && reboot"
+else
+    echo "TTY hardening skipped (HARDEN_TTY=no). Ctrl+Alt+F2 escape hatch stays available."
+    echo "  -> Set HARDEN_TTY=\"yes\" at the top for the final production image."
+fi
 
 # ============================================================================
 say "Installing the per-device first-setup helper (for cloned machines)"
@@ -441,14 +449,15 @@ cat <<EOF
   Cursor .............. visible
   RustDesk ............ background service, Restart=always, starts at boot
   Configs ............. root-owned, kiosk cannot edit or delete
+  TTY hardening ....... ${HARDEN_TTY}
   first-setup ......... /usr/local/bin/first-setup  (run once per cloned device)
 
   NEXT:
     1) reboot
     2) after boot: F12 -> RustDesk -> set a PERMANENT unattended password
-    3) test: F12 -> Restart App, Alt+F4 on app, F12 -> Admin Login
-    4) (optional hardening, do LAST) block TTY switching:
-         create /etc/X11/xorg.conf.d/10-kiosk.conf with DontVTSwitch/DontZap
+    3) test: F12 -> Restart App, Alt+F4 on app, F12 -> Admin Login, F12 -> Chrome
+    4) for the FINAL production image: set HARDEN_TTY="yes" at the top and re-run
+       (only after confirming RustDesk/SSH remote access works!)
 
   Reboot now?
 EOF
