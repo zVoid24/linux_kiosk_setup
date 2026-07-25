@@ -19,6 +19,16 @@
 #   sudo ./setup-kiosk.sh     # if logged in as an existing sudo user
 #
 # Everything is idempotent-ish: safe to re-run if something fails midway.
+#
+# ---------------------------------------------------------------------------
+# CONTROLS AFTER SETUP:
+#   F12 ............. Kiosk menu:  Restart App | Reboot System   (that's all)
+#   Ctrl+Alt+C ...... Open Chrome
+#   Ctrl+Alt+R ...... Open RustDesk
+#   Ctrl+Alt+T ...... Open Terminal -> pick Kiosk/Admin -> asks for that
+#                     user's PASSWORD before you get a shell.
+#   Alt+F4 .......... Closes admin windows (Chrome/RustDesk/Terminal) only.
+#                     The Modbus app is PROTECTED and can never be closed.
 ###############################################################################
 
 set -euo pipefail
@@ -34,14 +44,11 @@ KIOSK_USER="kiosk"          # the locked-down user (created by this script)
 #   - Or hardcode one here for fully non-interactive installs, e.g. "kiosk1234".
 KIOSK_PASSWORD=""
 
-# ---- Final TTY hardening (do this ONLY on production images) ---------------
-# When "yes", blocks Ctrl+Alt+F-keys (TTY switching) and Ctrl+Alt+Backspace
-# (kill X), so a user at the keyboard cannot escape to a text console.
-#   - Keep "no" while TESTING (so you keep the Ctrl+Alt+F2 escape hatch).
-#   - Set "yes" for the final locked deployment.
-#   WARNING: with "yes", if the GUI ever fails you can only get in via
-#   RustDesk / SSH / bootloader rescue — make sure remote access works first!
-HARDEN_TTY="no"
+# App launch keybinds (openbox syntax: C = Ctrl, A = Alt, W = Super/Windows).
+# Change these if you want different / more obscure combos.
+CHROME_KEYBIND="C-A-c"      # Ctrl+Alt+C -> Chrome
+RUSTDESK_KEYBIND="C-A-r"    # Ctrl+Alt+R -> RustDesk
+TERMINAL_KEYBIND="C-A-t"    # Ctrl+Alt+T -> Terminal (password-gated)
 
 # ---- Where your Flutter app comes from -------------------------------------
 # Option 1 (default): clone the app bundle from a git repo.
@@ -66,13 +73,7 @@ die()  { echo -e "\033[1;31mERROR: $*\033[0m"; exit 1; }
 
 # ---- sanity checks ---------------------------------------------------------
 [[ $EUID -eq 0 ]] || die "Run with sudo:  sudo ./setup-kiosk.sh   (or as root)"
-
-# Internet check: try several reliable hosts; pass if ANY responds.
-net_ok=0
-for host in archlinux.org google.com 1.1.1.1 8.8.8.8; do
-    if ping -c1 -W3 "$host" &>/dev/null; then net_ok=1; break; fi
-done
-[[ $net_ok -eq 1 ]] || die "No internet reachable. Connect first, then re-run. (Test with: ping google.com)"
+ping -c1 -W3 archlinux.org &>/dev/null || die "No internet. Connect first (nmcli / systemctl start NetworkManager)."
 
 KIOSK_HOME="/home/${KIOSK_USER}"
 
@@ -95,7 +96,7 @@ if ! id "$ADMIN_USER" &>/dev/null; then
     useradd -m -G wheel -s /bin/bash "$ADMIN_USER"
     echo ""
     echo "  Set a password for the new admin user '$ADMIN_USER'"
-    echo "  (you'll use this for F12 -> Admin Login and all sudo/remote admin):"
+    echo "  (you'll use this for the Admin terminal and all sudo/remote admin):"
 
     # try up to 3 times, then bail out with clear instructions instead of
     # looping forever (an unwritable/half-created state can make passwd always fail)
@@ -128,7 +129,9 @@ pacman -Syu --noconfirm
 pacman -S --needed --noconfirm \
     xorg-server xorg-xinit xorg-xset xorg-xhost \
     openbox rofi chromium pcmanfm \
-    xterm ttf-dejavu git base-devel
+    xterm xdotool ttf-dejavu git base-devel
+# NOTE: xdotool is new — it powers the "protect the Modbus window from Alt+F4"
+# guard in STEP 11.
 
 # ============================================================================
 say "STEP 2/13  Ensuring yay (AUR helper) is installed"
@@ -178,13 +181,14 @@ fi
 gpasswd -d "$KIOSK_USER" wheel 2>/dev/null || true
 
 # set the kiosk password: use KIOSK_PASSWORD if provided, else prompt.
-# A KNOWN password matters because polkit / su / screen dialogs may ask for it.
+# A KNOWN password matters because polkit / su / screen dialogs may ask for it,
+# AND because the Terminal in the Apps menu now REQUIRES it (see STEP 11).
 if [[ -n "$KIOSK_PASSWORD" ]]; then
     echo "${KIOSK_USER}:${KIOSK_PASSWORD}" | chpasswd
     echo "Kiosk password set from config."
 elif [[ -t 0 ]]; then
     echo ""
-    echo "  Set a password for the kiosk user (you may need it for polkit / su prompts):"
+    echo "  Set a password for the kiosk user (needed for the Terminal / polkit / su prompts):"
     passwd "$KIOSK_USER" || warn "Kiosk password not set — set later with: sudo passwd $KIOSK_USER"
 else
     # non-interactive (e.g. curl | bash) and no KIOSK_PASSWORD given -> sane default
@@ -266,34 +270,51 @@ exec openbox-session
 EOF
 
 # ============================================================================
-say "STEP 9/13  Creating the app systemd USER service (auto-restart)"
+say "STEP 9/13  Creating the app systemd USER service (UN-KILLABLE, auto-restart)"
 mkdir -p "${KIOSK_HOME}/.config/systemd/user"
+# StartLimitIntervalSec=0 disables systemd's default "give up after 5 restarts
+# in 10s" rate limit, so the Modbus app is relaunched forever no matter what.
 cat > "${KIOSK_HOME}/.config/systemd/user/kiosk-app.service" <<EOF
 [Unit]
 Description=Flutter Kiosk App
+StartLimitIntervalSec=0
 
 [Service]
 ExecStart=${APP_DIR}/${APP_BINARY}
 Restart=always
-RestartSec=2
+RestartSec=1
 
 [Install]
 WantedBy=default.target
 EOF
 
 # ============================================================================
-say "STEP 10/13  Openbox config (F12 menu + Alt+F4 to close, no decorations)"
+say "STEP 10/13  Openbox config (F12 menu + app keybinds + protected Alt+F4)"
 mkdir -p "${KIOSK_HOME}/.config/openbox"
-cat > "${KIOSK_HOME}/.config/openbox/rc.xml" <<'EOF'
+cat > "${KIOSK_HOME}/.config/openbox/rc.xml" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <openbox_config xmlns="http://openbox.org/3.4/rc">
   <focus><focusNew>yes</focusNew></focus>
   <keyboard>
+    <!-- F12: kiosk menu (Restart App / Reboot only) -->
     <keybind key="F12">
       <action name="Execute"><command>/usr/local/bin/kiosk-menu</command></action>
     </keybind>
+    <!-- Ctrl+Alt+C -> Chrome -->
+    <keybind key="${CHROME_KEYBIND}">
+      <action name="Execute"><command>chromium</command></action>
+    </keybind>
+    <!-- Ctrl+Alt+R -> RustDesk -->
+    <keybind key="${RUSTDESK_KEYBIND}">
+      <action name="Execute"><command>rustdesk</command></action>
+    </keybind>
+    <!-- Ctrl+Alt+T -> Terminal (asks which user + that user's password) -->
+    <keybind key="${TERMINAL_KEYBIND}">
+      <action name="Execute"><command>/usr/local/bin/kiosk-terminal</command></action>
+    </keybind>
+    <!-- Alt+F4: close focused window UNLESS it is the protected Modbus app -->
     <keybind key="A-F4">
-      <action name="Close"/>
+      <action name="Execute"><command>/usr/local/bin/kiosk-close</command></action>
     </keybind>
   </keyboard>
   <applications>
@@ -308,70 +329,144 @@ cat > "${KIOSK_HOME}/.config/openbox/rc.xml" <<'EOF'
 EOF
 
 # ============================================================================
-say "STEP 11/13  The F12 menu script + reboot sudoers rule"
+say "STEP 11/13  Menu scripts (F12 menu, password-gated Terminal, close-guard)"
+
+# ---- F12 menu: ONLY Restart App + Reboot ----------------------------------
 cat > /usr/local/bin/kiosk-menu <<'EOF'
 #!/bin/bash
-choice=$(printf "Restart App\nRustDesk\nChrome\nFile Manager\nTerminal\nAdmin Login\nReboot System" \
-  | rofi -dmenu -i -p "Kiosk Menu" -lines 7)
+choice=$(printf "Restart App\nReboot System" \
+  | rofi -dmenu -i -p "Kiosk Menu" -lines 2)
 
 case "$choice" in
   "Restart App")   systemctl --user restart kiosk-app.service ;;
-  "RustDesk")      rustdesk & ;;
-  "Chrome")        chromium & ;;
-  "File Manager")  pcmanfm & ;;
-  "Terminal")      xterm & ;;
-  "Admin Login")   xterm -e "su - ADMIN_PLACEHOLDER" & ;;
   "Reboot System") sudo /usr/bin/systemctl reboot ;;
 esac
 EOF
-sed -i "s/ADMIN_PLACEHOLDER/${ADMIN_USER}/" /usr/local/bin/kiosk-menu
 chmod 755 /usr/local/bin/kiosk-menu
 chown root:root /usr/local/bin/kiosk-menu
 
-# allow kiosk to run ONLY reboot with sudo
+# ---- Terminal: pick which user, then su asks for THAT user's password -----
+# Opening the terminal via 'su - <user>' means a shell is NEVER handed out
+# without the correct password — even for the kiosk user. So merely reaching
+# the terminal does not expose the filesystem.
+cat > /usr/local/bin/kiosk-terminal <<'EOF'
+#!/bin/bash
+# Ensure DISPLAY/XAUTHORITY are set so GUI apps launched by typing in the
+# terminal (chromium, pcmanfm, rustdesk) can reach the running X server.
+# startx stores its auth cookie in ~/.serverauth.* (not always ~/.Xauthority).
+export DISPLAY="${DISPLAY:-:0}"
+if [[ -z "${XAUTHORITY:-}" ]]; then
+    XAUTHORITY=$(ls -1t "$HOME"/.serverauth.* "$HOME"/.Xauthority 2>/dev/null | head -1)
+    export XAUTHORITY
+fi
+
+who=$(printf "Kiosk User\nAdmin User" \
+  | rofi -dmenu -i -p "Terminal as? (password required)" -lines 2)
+
+case "$who" in
+  "Kiosk User")
+      # 'su' WITHOUT '-' keeps DISPLAY + XAUTHORITY, so GUI apps work here.
+      # Using 'su -' (login shell) would wipe them -> "cannot open display".
+      # Password is still required, so the filesystem stays gated.
+      xterm -T "Kiosk Terminal — login required" -e "su KIOSK_PLACEHOLDER" & ;;
+  "Admin User")
+      # Admin gets a clean login shell for sudo / system work. Admin cannot
+      # read the kiosk X cookie, so admin GUI apps won't display unless you add
+      #   xhost +si:localuser:ADMIN_PLACEHOLDER   to ~/.xinitrc.
+      xterm -T "Admin Terminal — login required" -e "su - ADMIN_PLACEHOLDER" & ;;
+esac
+EOF
+sed -i "s/KIOSK_PLACEHOLDER/${KIOSK_USER}/" /usr/local/bin/kiosk-terminal
+sed -i "s/ADMIN_PLACEHOLDER/${ADMIN_USER}/" /usr/local/bin/kiosk-terminal
+chmod 755 /usr/local/bin/kiosk-terminal
+chown root:root /usr/local/bin/kiosk-terminal
+
+# ---- Alt+F4 guard: close anything EXCEPT the Modbus app -------------------
+# Identifies the protected window by the exact binary behind it (via its PID),
+# so the Modbus app can never be closed, while admin windows still close.
+cat > /usr/local/bin/kiosk-close <<'EOF'
+#!/bin/bash
+win=$(xdotool getactivewindow 2>/dev/null) || exit 0
+[[ -n "$win" ]] || exit 0
+pid=$(xdotool getwindowpid "$win" 2>/dev/null || true)
+if [[ -n "$pid" ]]; then
+    exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+    if [[ "$exe" == "APP_EXE_PLACEHOLDER" ]]; then
+        exit 0   # protected app — refuse to close
+    fi
+fi
+xdotool windowclose "$win"
+EOF
+sed -i "s#APP_EXE_PLACEHOLDER#${APP_DIR}/${APP_BINARY}#" /usr/local/bin/kiosk-close
+chmod 755 /usr/local/bin/kiosk-close
+chown root:root /usr/local/bin/kiosk-close
+
+# allow kiosk to run ONLY reboot with sudo (used by the F12 menu)
 echo "${KIOSK_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl reboot" > /etc/sudoers.d/kiosk-reboot
 chmod 440 /etc/sudoers.d/kiosk-reboot
 visudo -cf /etc/sudoers.d/kiosk-reboot >/dev/null || die "sudoers rule invalid"
 
 # ============================================================================
 say "STEP 12/13  RustDesk background service (unkillable, auto-restart)"
-# enable whatever the service is actually called.
-# NOTE: piping systemctl into 'awk ...exit' causes SIGPIPE which, under
-# 'set -o pipefail', returns 141 and would kill the script. So we drop the
-# early exit (awk reads all input) and guard the assignment with '|| true'.
+# enable whatever the service is actually called
 RD_UNIT=$(systemctl list-unit-files 2>/dev/null | awk '/rustdesk/{print $1}' | head -n1 || true)
 if [[ -n "${RD_UNIT:-}" ]]; then
-    systemctl enable "$RD_UNIT" || warn "could not enable $RD_UNIT (will still try to configure it)"
+    systemctl enable "$RD_UNIT"
     mkdir -p "/etc/systemd/system/${RD_UNIT}.d"
     cat > "/etc/systemd/system/${RD_UNIT}.d/override.conf" <<'EOF'
 [Service]
 Restart=always
 RestartSec=3
 EOF
-    systemctl daemon-reload || true
+    systemctl daemon-reload
     systemctl restart "$RD_UNIT" || true
-    echo "RustDesk service '$RD_UNIT' configured with Restart=always."
+    echo "RustDesk service '$RD_UNIT' enabled with Restart=always."
 else
     warn "No rustdesk systemd unit found. After reboot run RustDesk once, then re-check."
 fi
 
 # ============================================================================
-say "STEP 13/13  Chromium writable dirs, then LOCKING everything down"
+say "STEP 13/13  Pre-creating writable app-config dirs, then LOCKING everything down"
 
-# Chromium needs writable ~/.config/chromium (profile) AND ~/.cache/chromium
-# (crashpad database). Create as ROOT (works regardless of parent ownership),
-# then chown to kiosk. Other apps get their dirs too.
+# Writable sandboxes so chromium / pcmanfm don't crash on first launch.
+# IMPORTANT: chromium needs BOTH ~/.config/chromium (profile) AND
+# ~/.cache/chromium (crashpad database) — a missing ~/.cache/chromium is the
+# "chrome_crashpad_handler: --database is required" error.
+#
+# NOTE: earlier steps created ~/.config (via systemd/openbox) as ROOT, so the
+# kiosk user CANNOT mkdir inside it. We therefore create every dir as ROOT here,
+# then hand ownership of the app dirs back to kiosk.
 CFG_DIRS=(chromium pcmanfm libfm gtk-3.0 dconf)
+CACHE_DIRS=(chromium)
 
+# make sure the home + base dirs exist and belong to kiosk
 mkdir -p "${KIOSK_HOME}/.config" "${KIOSK_HOME}/.cache"
+
+# create all writable subdirs AS ROOT (always works), then chown to kiosk
 for d in "${CFG_DIRS[@]}"; do
     mkdir -p "${KIOSK_HOME}/.config/${d}"
     chown -R "${KIOSK_USER}:${KIOSK_USER}" "${KIOSK_HOME}/.config/${d}"
     chmod -R 755 "${KIOSK_HOME}/.config/${d}"
 done
-mkdir -p "${KIOSK_HOME}/.cache/chromium"
+for d in "${CACHE_DIRS[@]}"; do
+    mkdir -p "${KIOSK_HOME}/.cache/${d}"
+done
+# the whole ~/.cache belongs to kiosk (chromium writes lots of subdirs there)
 chown -R "${KIOSK_USER}:${KIOSK_USER}" "${KIOSK_HOME}/.cache"
 chmod 755 "${KIOSK_HOME}/.cache"
+
+mkdir -p /home/kiosk/.config/chromium /home/kiosk/.cache/chromium
+chown -R kiosk:kiosk /home/kiosk/.config/chromium /home/kiosk/.cache
+chmod -R 755 /home/kiosk/.config/chromium /home/kiosk/.cache
+
+# verify chromium can actually write its dirs (fail loudly if not)
+if ! sudo -u "$KIOSK_USER" test -w "${KIOSK_HOME}/.config/chromium" \
+   || ! sudo -u "$KIOSK_USER" test -w "${KIOSK_HOME}/.cache/chromium"; then
+    warn "Chromium dirs are NOT writable by ${KIOSK_USER} — Chrome will fail!"
+    warn "Check ownership of ${KIOSK_HOME}/.config/chromium and ${KIOSK_HOME}/.cache/chromium"
+else
+    echo "Chromium profile + cache dirs writable by ${KIOSK_USER}. Good."
+fi
 
 # lock the kiosk-owned config that must NOT be editable/deletable
 chown root:root "${KIOSK_HOME}/.bash_profile" "${KIOSK_HOME}/.xinitrc"
@@ -386,31 +481,16 @@ find "${KIOSK_HOME}/.config/openbox" "${KIOSK_HOME}/.config/systemd" -type f -ex
 chown root:root "${KIOSK_HOME}/.config"
 chmod 755       "${KIOSK_HOME}/.config"
 
+# ---------------------------------------------------------------------------
 # FINAL Chromium fix — run LAST so nothing above can undo it.
+# These are the exact commands confirmed to make Chrome work on a real kiosk:
+#   the profile (~/.config/chromium) and crashpad DB (~/.cache/chromium) must
+#   exist and be kiosk-owned. Hardcoded here so a fresh install never needs a
+#   manual fixup.
 mkdir -p "${KIOSK_HOME}/.config/chromium" "${KIOSK_HOME}/.cache/chromium"
 chown -R "${KIOSK_USER}:${KIOSK_USER}" "${KIOSK_HOME}/.config/chromium" "${KIOSK_HOME}/.cache"
 chmod -R 755 "${KIOSK_HOME}/.config/chromium" "${KIOSK_HOME}/.cache"
 echo "Chromium profile + cache dirs created and owned by ${KIOSK_USER}."
-
-# ============================================================================
-# Optional final hardening: block TTY switching + Ctrl+Alt+Backspace.
-# Controlled by HARDEN_TTY at the top. OFF by default so testing keeps the
-# Ctrl+Alt+F2 escape hatch.
-if [[ "$HARDEN_TTY" == "yes" ]]; then
-    say "HARDENING  Blocking TTY switching (DontVTSwitch) + kill-X (DontZap)"
-    mkdir -p /etc/X11/xorg.conf.d
-    cat > /etc/X11/xorg.conf.d/10-kiosk.conf <<'EOF'
-Section "ServerFlags"
-    Option "DontVTSwitch" "true"
-    Option "DontZap"      "true"
-EndSection
-EOF
-    warn "TTY switching is now DISABLED. Admin access = RustDesk / SSH / bootloader rescue only."
-    warn "To undo: sudo rm /etc/X11/xorg.conf.d/10-kiosk.conf && reboot"
-else
-    echo "TTY hardening skipped (HARDEN_TTY=no). Ctrl+Alt+F2 escape hatch stays available."
-    echo "  -> Set HARDEN_TTY=\"yes\" at the top for the final production image."
-fi
 
 # ============================================================================
 say "Installing the per-device first-setup helper (for cloned machines)"
@@ -430,7 +510,7 @@ rm -f /root/.config/rustdesk/RustDesk*.toml
 [[ -n "$RD" ]] && systemctl start "$RD"; sleep 3
 echo "=========================================="
 echo " Device: $NEWNAME"
-echo " Open RustDesk (F12) and set the permanent password!"
+echo " Open RustDesk (Ctrl+Alt+R) and set the permanent password!"
 echo "=========================================="
 read -p "Reboot now? [y/N] " a; [[ "$a" == y || "$a" == Y ]] && reboot
 EOF
@@ -443,21 +523,29 @@ cat <<EOF
 
   Kiosk user .......... ${KIOSK_USER}  (no sudo, autologin on tty1)
   Admin user .......... ${ADMIN_USER}  (full sudo)
-  App ................. ${APP_DIR}/${APP_BINARY}  (systemd user service, auto-restart)
-  F12 menu ............ Restart App / RustDesk / Chrome / File Manager / Terminal / Admin Login / Reboot
-  Alt+F4 .............. closes windows (app just auto-restarts)
+  App ................. ${APP_DIR}/${APP_BINARY}  (systemd user service)
+                        Restart=always + no start-limit -> UN-KILLABLE
+  F12 menu ............ Restart App | Reboot System   (nothing else)
+  Ctrl+Alt+C .......... Chrome
+  Ctrl+Alt+R .......... RustDesk
+  Ctrl+Alt+T .......... Terminal — asks which user (Kiosk/Admin), then that user's
+                        PASSWORD via 'su -' before any shell is given
+  Alt+F4 .............. closes admin windows only; the Modbus app is
+                        PROTECTED and will NOT close
   Cursor .............. visible
   RustDesk ............ background service, Restart=always, starts at boot
   Configs ............. root-owned, kiosk cannot edit or delete
-  TTY hardening ....... ${HARDEN_TTY}
   first-setup ......... /usr/local/bin/first-setup  (run once per cloned device)
 
   NEXT:
     1) reboot
-    2) after boot: F12 -> RustDesk -> set a PERMANENT unattended password
-    3) test: F12 -> Restart App, Alt+F4 on app, F12 -> Admin Login, F12 -> Chrome
-    4) for the FINAL production image: set HARDEN_TTY="yes" at the top and re-run
-       (only after confirming RustDesk/SSH remote access works!)
+    2) after boot: Ctrl+Alt+R (RustDesk) -> set a PERMANENT unattended password
+    3) test: F12 -> Restart App;  Alt+F4 on the app (should NOT close);
+             Ctrl+Alt+T -> Admin User (should ask for password)
+    4) to STOP the app for maintenance: open a Terminal (password required),
+       then:  systemctl --user stop kiosk-app.service
+    5) (optional hardening, do LAST) block TTY switching:
+         create /etc/X11/xorg.conf.d/10-kiosk.conf with DontVTSwitch/DontZap
 
   Reboot now?
 EOF
