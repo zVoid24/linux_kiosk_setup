@@ -29,6 +29,9 @@
 #                     user's PASSWORD before you get a shell.
 #   Alt+F4 .......... Closes admin windows (Chrome/RustDesk/Terminal) only.
 #                     The Modbus app is PROTECTED and can never be closed.
+#   Alt+Tab ......... Cycle between open windows and bring one to the front
+#                     (Alt+Shift+Tab cycles backward).
+#   Super+M ......... Snap the Modbus app back to the front instantly.
 ###############################################################################
 
 set -euo pipefail
@@ -289,7 +292,7 @@ WantedBy=default.target
 EOF
 
 # ============================================================================
-say "STEP 10/13  Openbox config (F12 menu + app keybinds + protected Alt+F4)"
+say "STEP 10/13  Openbox config (F12 menu + app keybinds + Alt+Tab + protected Alt+F4)"
 mkdir -p "${KIOSK_HOME}/.config/openbox"
 cat > "${KIOSK_HOME}/.config/openbox/rc.xml" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -315,6 +318,32 @@ cat > "${KIOSK_HOME}/.config/openbox/rc.xml" <<EOF
     <!-- Alt+F4: close focused window UNLESS it is the protected Modbus app -->
     <keybind key="A-F4">
       <action name="Execute"><command>/usr/local/bin/kiosk-close</command></action>
+    </keybind>
+    <!-- Alt+Tab: cycle FORWARD through windows and bring the choice to front -->
+    <keybind key="A-Tab">
+      <action name="NextWindow">
+        <dialog>icon</dialog>
+        <finalactions>
+          <action name="Focus"/>
+          <action name="Raise"/>
+          <action name="Unshade"/>
+        </finalactions>
+      </action>
+    </keybind>
+    <!-- Alt+Shift+Tab: cycle BACKWARD -->
+    <keybind key="A-S-Tab">
+      <action name="PreviousWindow">
+        <dialog>icon</dialog>
+        <finalactions>
+          <action name="Focus"/>
+          <action name="Raise"/>
+          <action name="Unshade"/>
+        </finalactions>
+      </action>
+    </keybind>
+    <!-- Super+M: snap the Modbus app back to the front instantly -->
+    <keybind key="W-m">
+      <action name="Execute"><command>/usr/local/bin/kiosk-focus-app</command></action>
     </keybind>
   </keyboard>
   <applications>
@@ -400,6 +429,29 @@ EOF
 sed -i "s#APP_EXE_PLACEHOLDER#${APP_DIR}/${APP_BINARY}#" /usr/local/bin/kiosk-close
 chmod 755 /usr/local/bin/kiosk-close
 chown root:root /usr/local/bin/kiosk-close
+
+# ---- Super+M: raise the Modbus app back to the front ----------------------
+# Finds the window whose process is the Modbus binary (independent of window
+# title) and activates it — so after using admin apps you can snap back.
+cat > /usr/local/bin/kiosk-focus-app <<'EOF'
+#!/bin/bash
+target="APP_EXE_PLACEHOLDER"
+for win in $(xdotool search --onlyvisible --name "" 2>/dev/null); do
+    pid=$(xdotool getwindowpid "$win" 2>/dev/null || true)
+    [[ -n "$pid" ]] || continue
+    exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+    if [[ "$exe" == "$target" ]]; then
+        xdotool windowactivate "$win" 2>/dev/null
+        xdotool windowraise  "$win" 2>/dev/null
+        exit 0
+    fi
+done
+# fallback: restart the app service if no window was found
+systemctl --user restart kiosk-app.service 2>/dev/null || true
+EOF
+sed -i "s#APP_EXE_PLACEHOLDER#${APP_DIR}/${APP_BINARY}#" /usr/local/bin/kiosk-focus-app
+chmod 755 /usr/local/bin/kiosk-focus-app
+chown root:root /usr/local/bin/kiosk-focus-app
 
 # allow kiosk to run ONLY reboot with sudo (used by the F12 menu)
 echo "${KIOSK_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl reboot" > /etc/sudoers.d/kiosk-reboot
@@ -532,6 +584,8 @@ cat <<EOF
                         PASSWORD via 'su -' before any shell is given
   Alt+F4 .............. closes admin windows only; the Modbus app is
                         PROTECTED and will NOT close
+  Alt+Tab ............. cycle windows & bring to front (Alt+Shift+Tab = back)
+  Super+M ............. snap the Modbus app back to the front
   Cursor .............. visible
   RustDesk ............ background service, Restart=always, starts at boot
   Configs ............. root-owned, kiosk cannot edit or delete
