@@ -316,6 +316,26 @@ cat > "${KIOSK_HOME}/.config/openbox/rc.xml" <<EOF
     <keybind key="A-F4">
       <action name="Execute"><command>/usr/local/bin/kiosk-close</command></action>
     </keybind>
+    <!-- Alt+Tab -> cycle windows forward -->
+    <keybind key="A-Tab">
+      <action name="NextWindow">
+        <finalactions>
+          <action name="Focus"/>
+          <action name="Raise"/>
+          <action name="Unshade"/>
+        </finalactions>
+      </action>
+    </keybind>
+    <!-- Alt+Shift+Tab -> cycle windows backward -->
+    <keybind key="A-S-Tab">
+      <action name="PreviousWindow">
+        <finalactions>
+          <action name="Focus"/>
+          <action name="Raise"/>
+          <action name="Unshade"/>
+        </finalactions>
+      </action>
+    </keybind>
   </keyboard>
   <applications>
     <application class="*">
