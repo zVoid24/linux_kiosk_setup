@@ -288,6 +288,12 @@ RestartSec=1
 WantedBy=default.target
 EOF
 
+# Keep the kiosk user's systemd --user manager alive independent of login
+# sessions, so logind can't sweep the app when a session ends. This is the
+# operational fix for the SIGKILL session-teardown case (which no in-app
+# signal handler can catch).
+loginctl enable-linger "${KIOSK_USER}"
+
 # ============================================================================
 say "STEP 10/13  Openbox config (F12 menu + app keybinds + protected Alt+F4)"
 mkdir -p "${KIOSK_HOME}/.config/openbox"
