@@ -283,6 +283,12 @@ StartLimitIntervalSec=0
 ExecStart=${APP_DIR}/${APP_BINARY}
 Restart=always
 RestartSec=1
+# Raises the default 1024 soft fd limit to match this system's hard ceiling.
+# A slow fd leak (fixed in the app itself, but this is cheap extra headroom
+# against any future one) previously exhausted the default 1024 within
+# ~8 hours of 24/7 runtime, after which Process.start() failed for
+# everything and the backend could never respawn until the app restarted.
+LimitNOFILE=524288
 
 [Install]
 WantedBy=default.target
