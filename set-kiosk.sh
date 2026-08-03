@@ -289,6 +289,12 @@ RestartSec=1
 # ~8 hours of 24/7 runtime, after which Process.start() failed for
 # everything and the backend could never respawn until the app restarted.
 LimitNOFILE=524288
+# Backstop only — there is no known leak, but this box has no memory ceiling
+# of any kind and an unbounded one would otherwise let the kernel OOM killer
+# pick an arbitrary victim (X, the daemon, or this app). A restart here costs
+# ~1s and is always preferable to an OOM cascade on a kiosk. Raise this if the
+# app legitimately needs more; steady state is a few hundred MB.
+MemoryMax=2G
 
 [Install]
 WantedBy=default.target
