@@ -8,15 +8,18 @@
 #   - Arch is installed and booted
 #   - Internet works (ping archlinux.org)
 #   - Your Flutter app is available as a git repo (default) or local folder
-#     (configured via APP_REPO / APP_SRC below)
+#     (configured via APP_REPO / APP_BRANCH / APP_SRC below)
 #
 # The admin (sudo) user is created automatically if it doesn't exist yet —
 # you'll be prompted to set its password once.
 #
 # RUN IT LIKE THIS (as root on a fresh install, or via sudo):
 #   chmod +x setup-kiosk.sh
-#   ./setup-kiosk.sh          # if logged in as root
-#   sudo ./setup-kiosk.sh     # if logged in as an existing sudo user
+#   ./setup-kiosk.sh                          # if logged in as root
+#   sudo ./setup-kiosk.sh                     # if logged in as an existing sudo user
+#
+#   # deploy a specific branch/tag without editing this file:
+#   sudo APP_BRANCH=release-2.1 ./setup-kiosk.sh
 #
 # Everything is idempotent-ish: safe to re-run if something fails midway.
 #
@@ -53,6 +56,18 @@ TERMINAL_KEYBIND="C-A-t"    # Ctrl+Alt+T -> Terminal (password-gated)
 # ---- Where your Flutter app comes from -------------------------------------
 # Option 1 (default): clone the app bundle from a git repo.
 APP_REPO="https://github.com/zVoid24/modbus_linux_bundle.git"
+
+# Branch (or TAG) to deploy. This changes per release, so it can also be
+# overridden at runtime without editing this file:
+#     sudo APP_BRANCH=release-2.1 ./setup-kiosk.sh
+# Leave it "" to just use whatever the repo's default branch is.
+# NOTE: a bare commit SHA will NOT work here (shallow clone limitation) —
+# use APP_COMMIT below for that instead.
+APP_BRANCH="${APP_BRANCH:-main}"
+
+# Optional: pin an exact commit SHA. If set, the clone is done full-depth on
+# APP_BRANCH and then checked out at this commit. Leave "" to ignore.
+APP_COMMIT="${APP_COMMIT:-}"
 
 # Option 2: use a local folder already on disk instead of git.
 #   Leave APP_REPO="" and set APP_SRC to the bundle folder path.
@@ -202,12 +217,45 @@ mkdir -p "$APP_DIR"
 if [[ -n "$APP_REPO" ]]; then
     # clone the bundle from git into a temp dir, then copy its contents in
     TMP_CLONE="$(mktemp -d)"
-    echo "Cloning app from $APP_REPO ..."
-    git clone --depth 1 "$APP_REPO" "$TMP_CLONE" || die "git clone failed: $APP_REPO"
+    echo "Repo ...... $APP_REPO"
+    echo "Branch .... ${APP_BRANCH:-<repo default>}"
+    [[ -n "$APP_COMMIT" ]] && echo "Commit .... $APP_COMMIT"
+
+    if [[ -n "$APP_COMMIT" ]]; then
+        # full clone needed so an arbitrary SHA is reachable
+        if [[ -n "$APP_BRANCH" ]]; then
+            git clone --branch "$APP_BRANCH" "$APP_REPO" "$TMP_CLONE" \
+                || die "git clone failed: $APP_REPO (branch '$APP_BRANCH' — does it exist?)"
+        else
+            git clone "$APP_REPO" "$TMP_CLONE" || die "git clone failed: $APP_REPO"
+        fi
+        git -C "$TMP_CLONE" checkout --detach "$APP_COMMIT" \
+            || die "git checkout failed: commit '$APP_COMMIT' not found in $APP_REPO"
+    elif [[ -n "$APP_BRANCH" ]]; then
+        # shallow, single-branch clone — fastest for a normal branch/tag deploy
+        git clone --depth 1 --single-branch --branch "$APP_BRANCH" "$APP_REPO" "$TMP_CLONE" \
+            || die "git clone failed: $APP_REPO (branch/tag '$APP_BRANCH' — does it exist?)"
+    else
+        git clone --depth 1 "$APP_REPO" "$TMP_CLONE" || die "git clone failed: $APP_REPO"
+    fi
+
+    # record what was actually deployed (handy when debugging a device later)
+    DEPLOYED_REF="$(git -C "$TMP_CLONE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+
     # copy everything except the .git folder
     (shopt -s dotglob; cp -r "$TMP_CLONE"/* "$APP_DIR"/ 2>/dev/null || true)
     rm -rf "$APP_DIR/.git" "$TMP_CLONE"
-    echo "Deployed app from repo."
+
+    # leave a breadcrumb on disk
+    {
+        echo "repo=$APP_REPO"
+        echo "branch=${APP_BRANCH:-<default>}"
+        echo "commit=$DEPLOYED_REF"
+        echo "deployed=$(date -Is)"
+    } > "${APP_DIR}/.deployed-version"
+    chmod 644 "${APP_DIR}/.deployed-version"
+
+    echo "Deployed app from repo (branch '${APP_BRANCH:-<default>}' @ $DEPLOYED_REF)."
 elif [[ -n "$APP_SRC" ]]; then
     [[ -d "$APP_SRC" ]] || die "APP_SRC '$APP_SRC' not found. Fix the path at the top of this script."
     cp -r "${APP_SRC}/." "$APP_DIR/"
@@ -533,6 +581,64 @@ chmod -R 755 "${KIOSK_HOME}/.config/chromium" "${KIOSK_HOME}/.cache"
 echo "Chromium profile + cache dirs created and owned by ${KIOSK_USER}."
 
 # ============================================================================
+say "Installing the app updater helper (re-deploy a different branch later)"
+cat > /usr/local/bin/kiosk-update-app <<'EOF'
+#!/bin/bash
+# Re-deploy the Flutter bundle from git without re-running the whole setup.
+# Usage: sudo kiosk-update-app [branch-or-tag] [commit-sha]
+#        sudo kiosk-update-app release-2.1
+set -euo pipefail
+[[ $EUID -eq 0 ]] || { echo "Run with sudo: sudo kiosk-update-app <branch>"; exit 1; }
+
+APP_REPO="REPO_PLACEHOLDER"
+APP_DIR="APPDIR_PLACEHOLDER"
+APP_BINARY="BINARY_PLACEHOLDER"
+KIOSK_USER="KIOSKUSER_PLACEHOLDER"
+BRANCH="${1:-BRANCH_PLACEHOLDER}"
+COMMIT="${2:-}"
+
+[[ -n "$APP_REPO" ]] || { echo "This kiosk was not deployed from git — nothing to update."; exit 1; }
+
+TMP="$(mktemp -d)"
+echo "==> cloning $APP_REPO (branch: $BRANCH)"
+git clone --depth 1 --single-branch --branch "$BRANCH" "$APP_REPO" "$TMP"
+if [[ -n "$COMMIT" ]]; then
+    echo "==> fetching + checking out $COMMIT"
+    git -C "$TMP" fetch --unshallow || true
+    git -C "$TMP" checkout --detach "$COMMIT"
+fi
+REF="$(git -C "$TMP" rev-parse --short HEAD)"
+
+echo "==> stopping app"
+su - "$KIOSK_USER" -c 'systemctl --user stop kiosk-app.service' 2>/dev/null \
+  || systemctl --user -M "${KIOSK_USER}@" stop kiosk-app.service 2>/dev/null || true
+
+echo "==> replacing $APP_DIR"
+rm -rf "${APP_DIR}.old"
+[[ -d "$APP_DIR" ]] && mv "$APP_DIR" "${APP_DIR}.old"
+mkdir -p "$APP_DIR"
+(shopt -s dotglob; cp -r "$TMP"/* "$APP_DIR"/)
+rm -rf "$APP_DIR/.git" "$TMP"
+{ echo "repo=$APP_REPO"; echo "branch=$BRANCH"; echo "commit=$REF"; echo "deployed=$(date -Is)"; } \
+  > "${APP_DIR}/.deployed-version"
+chown -R root:root "$APP_DIR"; chmod -R 755 "$APP_DIR"
+chmod +x "${APP_DIR}/${APP_BINARY}" 2>/dev/null || true
+
+echo "==> starting app"
+su - "$KIOSK_USER" -c 'systemctl --user start kiosk-app.service' 2>/dev/null \
+  || systemctl --user -M "${KIOSK_USER}@" start kiosk-app.service 2>/dev/null || true
+
+echo "Updated to $BRANCH @ $REF.  Previous version kept at ${APP_DIR}.old"
+EOF
+sed -i "s#REPO_PLACEHOLDER#${APP_REPO}#"        /usr/local/bin/kiosk-update-app
+sed -i "s#APPDIR_PLACEHOLDER#${APP_DIR}#"       /usr/local/bin/kiosk-update-app
+sed -i "s#BINARY_PLACEHOLDER#${APP_BINARY}#"    /usr/local/bin/kiosk-update-app
+sed -i "s#KIOSKUSER_PLACEHOLDER#${KIOSK_USER}#" /usr/local/bin/kiosk-update-app
+sed -i "s#BRANCH_PLACEHOLDER#${APP_BRANCH:-main}#" /usr/local/bin/kiosk-update-app
+chmod 755 /usr/local/bin/kiosk-update-app
+chown root:root /usr/local/bin/kiosk-update-app
+
+# ============================================================================
 say "Installing the per-device first-setup helper (for cloned machines)"
 cat > /usr/local/bin/first-setup <<'EOF'
 #!/bin/bash
@@ -565,6 +671,9 @@ cat <<EOF
   Admin user .......... ${ADMIN_USER}  (full sudo)
   App ................. ${APP_DIR}/${APP_BINARY}  (systemd user service)
                         Restart=always + no start-limit -> UN-KILLABLE
+  Source .............. ${APP_REPO:-${APP_SRC:-<pre-placed in APP_DIR>}}
+  Branch .............. ${APP_BRANCH:-<repo default>}${APP_COMMIT:+  (pinned @ ${APP_COMMIT})}
+                        recorded in ${APP_DIR}/.deployed-version
   F12 menu ............ Restart App | Reboot System   (nothing else)
   Ctrl+Alt+C .......... Chrome
   Ctrl+Alt+R .......... RustDesk
@@ -575,7 +684,8 @@ cat <<EOF
   Cursor .............. visible
   RustDesk ............ background service, Restart=always, starts at boot
   Configs ............. root-owned, kiosk cannot edit or delete
-  first-setup ......... /usr/local/bin/first-setup  (run once per cloned device)
+  first-setup ......... /usr/local/bin/first-setup       (run once per cloned device)
+  kiosk-update-app .... /usr/local/bin/kiosk-update-app  (re-deploy another branch)
 
   NEXT:
     1) reboot
@@ -584,7 +694,8 @@ cat <<EOF
              Ctrl+Alt+T -> Admin User (should ask for password)
     4) to STOP the app for maintenance: open a Terminal (password required),
        then:  systemctl --user stop kiosk-app.service
-    5) (optional hardening, do LAST) block TTY switching:
+    5) to deploy a new branch later:  sudo kiosk-update-app <branch>
+    6) (optional hardening, do LAST) block TTY switching:
          create /etc/X11/xorg.conf.d/10-kiosk.conf with DontVTSwitch/DontZap
 
   Reboot now?
