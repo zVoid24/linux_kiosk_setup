@@ -195,6 +195,13 @@ fi
 # make absolutely sure kiosk has no sudo
 gpasswd -d "$KIOSK_USER" wheel 2>/dev/null || true
 
+# RS485/serial hardware access — Arch assigns real serial ports (and most
+# USB-to-serial adapters) to group 'uucp' (Debian/Ubuntu use 'dialout'
+# instead; 'uucp' is correct here). Without this, reading any Modbus RTU
+# meter over a serial port fails with "no permission to access it".
+usermod -aG uucp "$KIOSK_USER"
+echo "Added '$KIOSK_USER' to group 'uucp' (serial / RS485 access)."
+
 # set the kiosk password: use KIOSK_PASSWORD if provided, else prompt.
 # A KNOWN password matters because polkit / su / screen dialogs may ask for it,
 # AND because the Terminal in the Apps menu now REQUIRES it (see STEP 11).
@@ -668,6 +675,7 @@ say "DONE. Summary:"
 cat <<EOF
 
   Kiosk user .......... ${KIOSK_USER}  (no sudo, autologin on tty1)
+                        member of 'uucp' -> RS485 / serial port access
   Admin user .......... ${ADMIN_USER}  (full sudo)
   App ................. ${APP_DIR}/${APP_BINARY}  (systemd user service)
                         Restart=always + no start-limit -> UN-KILLABLE
@@ -692,10 +700,11 @@ cat <<EOF
     2) after boot: Ctrl+Alt+R (RustDesk) -> set a PERMANENT unattended password
     3) test: F12 -> Restart App;  Alt+F4 on the app (should NOT close);
              Ctrl+Alt+T -> Admin User (should ask for password)
-    4) to STOP the app for maintenance: open a Terminal (password required),
+    4) RS485: Settings -> RS485 -> enter port/baud/parity for this device
+    5) to STOP the app for maintenance: open a Terminal (password required),
        then:  systemctl --user stop kiosk-app.service
-    5) to deploy a new branch later:  sudo kiosk-update-app <branch>
-    6) (optional hardening, do LAST) block TTY switching:
+    6) to deploy a new branch later:  sudo kiosk-update-app <branch>
+    7) (optional hardening, do LAST) block TTY switching:
          create /etc/X11/xorg.conf.d/10-kiosk.conf with DontVTSwitch/DontZap
 
   Reboot now?
