@@ -24,6 +24,12 @@
 # Everything is idempotent-ish: safe to re-run if something fails midway.
 #
 # ---------------------------------------------------------------------------
+# HARDWARE ACCESS GRANTED TO THE KIOSK USER:
+#   RS485 / serial ... group 'uucp'  -> /dev/ttyS*, /dev/ttyUSB*, /dev/ttyACM*
+#   Digital IO ....... group 'gpio'  -> /dev/gpiochip* (ITE IT8786 Super-I/O)
+#   Neither needs sudo at runtime, which matters because the kiosk user has none.
+#
+# ---------------------------------------------------------------------------
 # CONTROLS AFTER SETUP:
 #   F12 ............. Kiosk menu:  Restart App | Reboot System   (that's all)
 #   Ctrl+Alt+C ...... Open Chrome
@@ -79,6 +85,16 @@ APP_BINARY="modbus"
 
 # Install location (do not usually need to change):
 APP_DIR="/opt/hybridController"
+
+# ---- GPIO (digital IO) ------------------------------------------------------
+# Kernel module for this board's Super-I/O GPIO controller. The Norqin panel
+# PC uses an ITE IT8786, driven by gpio-it87. Set to "" to skip module setup
+# entirely (e.g. if the chip is already built into your kernel).
+GPIO_MODULE="gpio-it87"
+
+# Group that owns /dev/gpiochip*. Arch does not ship a 'gpio' group, so this
+# script creates it.
+GPIO_GROUP="gpio"
 ##############################################################################
 
 # ---- helpers ---------------------------------------------------------------
@@ -95,7 +111,7 @@ KIOSK_HOME="/home/${KIOSK_USER}"
 # ---- ensure the admin (sudo) user exists -----------------------------------
 # The AUR builds (yay, rustdesk) must run as a NON-root user with sudo, because
 # makepkg refuses to run as root. So we guarantee $ADMIN_USER exists and has sudo.
-say "STEP 0/13  Ensuring admin user '$ADMIN_USER' exists with sudo"
+say "STEP 0/14  Ensuring admin user '$ADMIN_USER' exists with sudo"
 
 # make sure sudo + the wheel sudoers rule are in place
 pacman -S --needed --noconfirm sudo
@@ -139,17 +155,19 @@ else
 fi
 
 # ============================================================================
-say "STEP 1/13  Installing official packages"
+say "STEP 1/14  Installing official packages"
 pacman -Syu --noconfirm
 pacman -S --needed --noconfirm \
     xorg-server xorg-xinit xorg-xset xorg-xhost \
     openbox rofi chromium pcmanfm \
-    xterm xdotool ttf-dejavu git base-devel
-# NOTE: xdotool is new — it powers the "protect the Modbus window from Alt+F4"
-# guard in STEP 11.
+    xterm xdotool ttf-dejavu git base-devel libgpiod
+# NOTE: xdotool powers the "protect the Modbus window from Alt+F4" guard in
+# STEP 11. libgpiod is NOT used by the app (it talks to the chardev ioctl ABI
+# directly) — it is installed for gpiodetect/gpioinfo, which are the fastest
+# way to debug a dead GPIO on-site.
 
 # ============================================================================
-say "STEP 2/13  Ensuring yay (AUR helper) is installed"
+say "STEP 2/14  Ensuring yay (AUR helper) is installed"
 
 # makepkg runs 'sudo pacman' internally to install built packages. Since this
 # script runs unattended, grant admin TEMPORARY passwordless sudo for the build,
@@ -175,7 +193,7 @@ else
 fi
 
 # ============================================================================
-say "STEP 3/13  Installing RustDesk (from AUR)"
+say "STEP 3/14  Installing RustDesk (from AUR)"
 if ! command -v rustdesk &>/dev/null; then
     sudo -u "$ADMIN_USER" yay -S --noconfirm rustdesk-bin
 else
@@ -187,7 +205,7 @@ cleanup_tmp_sudo
 trap - EXIT
 
 # ============================================================================
-say "STEP 4/13  Creating locked-down kiosk user"
+say "STEP 4/14  Creating locked-down kiosk user"
 if ! id "$KIOSK_USER" &>/dev/null; then
     useradd -m -s /bin/bash "$KIOSK_USER"
     echo "Created user '$KIOSK_USER' (NOT in wheel group -> no sudo)."
@@ -195,12 +213,30 @@ fi
 # make absolutely sure kiosk has no sudo
 gpasswd -d "$KIOSK_USER" wheel 2>/dev/null || true
 
-# RS485/serial hardware access — Arch assigns real serial ports (and most
-# USB-to-serial adapters) to group 'uucp' (Debian/Ubuntu use 'dialout'
-# instead; 'uucp' is correct here). Without this, reading any Modbus RTU
-# meter over a serial port fails with "no permission to access it".
+# ---- RS485 / serial hardware access ----------------------------------------
+# Arch assigns real serial ports (and most USB-to-serial adapters) to group
+# 'uucp' (Debian/Ubuntu use 'dialout' instead; 'uucp' is correct here).
+# Without this, reading any Modbus RTU meter over a serial port fails with
+# "no permission to access it".
 usermod -aG uucp "$KIOSK_USER"
 echo "Added '$KIOSK_USER' to group 'uucp' (serial / RS485 access)."
+
+# ---- GPIO / digital IO access ----------------------------------------------
+# The app opens /dev/gpiochip0 directly through the Linux GPIO character
+# device ioctl ABI. Arch ships no 'gpio' group, so create it here; the udev
+# rule in STEP 12 hands the chip node to it. Without this, open() returns
+# EACCES and every digital IO silently fails — and the kiosk user has no sudo
+# to work around it at runtime.
+groupadd -f "$GPIO_GROUP"
+usermod -aG "$GPIO_GROUP" "$KIOSK_USER"
+echo "Added '$KIOSK_USER' to group '$GPIO_GROUP' (/dev/gpiochip* access)."
+
+# NOTE ON GROUP TIMING: a systemd --user manager inherits its supplementary
+# groups from the PAM session that spawned it and can never change them
+# afterwards. Both usermod calls above happen BEFORE enable-linger (STEP 9)
+# and before the final reboot, so the app picks them up. If you ever add a
+# group to this user later, a re-login is NOT enough — run
+# 'loginctl terminate-user kiosk' or reboot.
 
 # set the kiosk password: use KIOSK_PASSWORD if provided, else prompt.
 # A KNOWN password matters because polkit / su / screen dialogs may ask for it,
@@ -219,7 +255,7 @@ else
 fi
 
 # ============================================================================
-say "STEP 5/13  Deploying the Flutter app to $APP_DIR"
+say "STEP 5/14  Deploying the Flutter app to $APP_DIR"
 mkdir -p "$APP_DIR"
 if [[ -n "$APP_REPO" ]]; then
     # clone the bundle from git into a temp dir, then copy its contents in
@@ -276,7 +312,7 @@ chmod +x "${APP_DIR}/${APP_BINARY}" 2>/dev/null || true
 [[ -x "${APP_DIR}/${APP_BINARY}" ]] || warn "Binary ${APP_DIR}/${APP_BINARY} not found/executable — check APP_BINARY."
 
 # ============================================================================
-say "STEP 6/13  Configuring autologin on tty1"
+say "STEP 6/14  Configuring autologin on tty1"
 mkdir -p /etc/systemd/system/getty@tty1.service.d
 cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf <<EOF
 [Service]
@@ -285,7 +321,7 @@ ExecStart=-/usr/bin/agetty --autologin ${KIOSK_USER} --noclear %I \$TERM
 EOF
 
 # ============================================================================
-say "STEP 7/13  Writing .bash_profile (auto-start X, cursor VISIBLE)"
+say "STEP 7/14  Writing .bash_profile (auto-start X, cursor VISIBLE)"
 cat > "${KIOSK_HOME}/.bash_profile" <<'EOF'
 [[ -f ~/.bashrc ]] && . ~/.bashrc
 
@@ -298,7 +334,7 @@ fi
 EOF
 
 # ---- .xinitrc (cursor visible: no -nocursor, no unclutter) ----
-say "STEP 8/13  Writing .xinitrc (starts app service + gives root display access for RustDesk)"
+say "STEP 8/14  Writing .xinitrc (starts app service + gives root display access for RustDesk)"
 cat > "${KIOSK_HOME}/.xinitrc" <<'EOF'
 #!/bin/bash
 # Tell apps this is an X11 session. Because we start X with startx (no display
@@ -325,7 +361,7 @@ exec openbox-session
 EOF
 
 # ============================================================================
-say "STEP 9/13  Creating the app systemd USER service (UN-KILLABLE, auto-restart)"
+say "STEP 9/14  Creating the app systemd USER service (UN-KILLABLE, auto-restart)"
 mkdir -p "${KIOSK_HOME}/.config/systemd/user"
 # StartLimitIntervalSec=0 disables systemd's default "give up after 5 restarts
 # in 10s" rate limit, so the Modbus app is relaunched forever no matter what.
@@ -362,7 +398,7 @@ EOF
 loginctl enable-linger "${KIOSK_USER}"
 
 # ============================================================================
-say "STEP 10/13  Openbox config (F12 menu + app keybinds + protected Alt+F4)"
+say "STEP 10/14  Openbox config (F12 menu + app keybinds + protected Alt+F4)"
 mkdir -p "${KIOSK_HOME}/.config/openbox"
 cat > "${KIOSK_HOME}/.config/openbox/rc.xml" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -422,7 +458,7 @@ cat > "${KIOSK_HOME}/.config/openbox/rc.xml" <<EOF
 EOF
 
 # ============================================================================
-say "STEP 11/13  Menu scripts (F12 menu, password-gated Terminal, close-guard)"
+say "STEP 11/14  Menu scripts (F12 menu, password-gated Terminal, close-guard)"
 
 # ---- F12 menu: ONLY Restart App + Reboot ----------------------------------
 cat > /usr/local/bin/kiosk-menu <<'EOF'
@@ -502,7 +538,58 @@ chmod 440 /etc/sudoers.d/kiosk-reboot
 visudo -cf /etc/sudoers.d/kiosk-reboot >/dev/null || die "sudoers rule invalid"
 
 # ============================================================================
-say "STEP 12/13  RustDesk background service (unkillable, auto-restart)"
+say "STEP 12/14  GPIO: Super-I/O driver + /dev/gpiochip* permissions"
+
+# ---- kernel module ---------------------------------------------------------
+# The IT8786 GPIO controller is not probed automatically — it needs gpio-it87.
+if [[ -n "$GPIO_MODULE" ]]; then
+    echo "$GPIO_MODULE" > "/etc/modules-load.d/${GPIO_MODULE}.conf"
+    chmod 644 "/etc/modules-load.d/${GPIO_MODULE}.conf"
+    if modprobe "$GPIO_MODULE" 2>/dev/null; then
+        echo "Loaded kernel module '$GPIO_MODULE' (and set it to load at boot)."
+    else
+        warn "modprobe $GPIO_MODULE failed."
+        warn "Most common cause: ACPI has already claimed the Super-I/O ports."
+        warn "Check with:  dmesg | grep -iE 'it87|resource'"
+        warn "Fix: add  acpi_enforce_resources=lax  to the kernel cmdline, reboot."
+        warn "If the chip ID is not recognised, try:  modprobe $GPIO_MODULE force_id=0x8786"
+    fi
+fi
+
+# ---- udev rule -------------------------------------------------------------
+# Only the character device matters. The app (norqin_gpio.dart / ngpio) opens
+# /dev/gpiochip0 and drives it through the GPIO chardev ioctl ABI — it never
+# touches the legacy /sys/class/gpio export interface, so no sysfs rules here.
+cat > /etc/udev/rules.d/99-gpio.rules <<EOF
+# Hand the GPIO character device to group '${GPIO_GROUP}' so the kiosk user can
+# open it without sudo. Terminals 1-8 on this board are gpiochip0 lines 48-55.
+SUBSYSTEM=="gpio", KERNEL=="gpiochip*", GROUP="${GPIO_GROUP}", MODE="0660"
+EOF
+chmod 644 /etc/udev/rules.d/99-gpio.rules
+udevadm control --reload
+udevadm trigger --subsystem-match=gpio || true
+
+# ---- verify ----------------------------------------------------------------
+if compgen -G "/dev/gpiochip*" >/dev/null; then
+    echo "GPIO character devices present:"
+    ls -l /dev/gpiochip*
+    gpiodetect 2>/dev/null || true
+    # the only check that really counts: can the kiosk user open the chip?
+    if sudo -u "$KIOSK_USER" test -r /dev/gpiochip0 && sudo -u "$KIOSK_USER" test -w /dev/gpiochip0; then
+        echo "'$KIOSK_USER' can read+write /dev/gpiochip0. Good."
+    else
+        warn "'$KIOSK_USER' still cannot access /dev/gpiochip0."
+        warn "This is usually just group caching — it will be correct after the reboot."
+        warn "Verify after boot with:  sudo -u $KIOSK_USER ngpio show"
+    fi
+else
+    warn "No /dev/gpiochip* on this board — digital IO (terminals 1-8) will NOT work."
+    warn "The udev rule is installed and will apply as soon as a chip appears."
+    warn "Debug with:  dmesg | grep -i it87   /   modinfo $GPIO_MODULE   /   gpiodetect"
+fi
+
+# ============================================================================
+say "STEP 13/14  RustDesk background service (unkillable, auto-restart)"
 # enable whatever the service is actually called
 RD_UNIT=$(systemctl list-unit-files 2>/dev/null | awk '/rustdesk/{print $1}' | head -n1 || true)
 if [[ -n "${RD_UNIT:-}" ]]; then
@@ -521,7 +608,7 @@ else
 fi
 
 # ============================================================================
-say "STEP 13/13  Pre-creating writable app-config dirs, then LOCKING everything down"
+say "STEP 14/14  Pre-creating writable app-config dirs, then LOCKING everything down"
 
 # Writable sandboxes so chromium / pcmanfm don't crash on first launch.
 # IMPORTANT: chromium needs BOTH ~/.config/chromium (profile) AND
@@ -549,10 +636,6 @@ done
 # the whole ~/.cache belongs to kiosk (chromium writes lots of subdirs there)
 chown -R "${KIOSK_USER}:${KIOSK_USER}" "${KIOSK_HOME}/.cache"
 chmod 755 "${KIOSK_HOME}/.cache"
-
-mkdir -p /home/kiosk/.config/chromium /home/kiosk/.cache/chromium
-chown -R kiosk:kiosk /home/kiosk/.config/chromium /home/kiosk/.cache
-chmod -R 755 /home/kiosk/.config/chromium /home/kiosk/.cache
 
 # verify chromium can actually write its dirs (fail loudly if not)
 if ! sudo -u "$KIOSK_USER" test -w "${KIOSK_HOME}/.config/chromium" \
@@ -646,6 +729,62 @@ chmod 755 /usr/local/bin/kiosk-update-app
 chown root:root /usr/local/bin/kiosk-update-app
 
 # ============================================================================
+say "Installing the GPIO diagnostic helper"
+# One command an on-site technician can run to find out why digital IO is dead.
+cat > /usr/local/bin/kiosk-gpio-check <<'EOF'
+#!/bin/bash
+# Diagnose GPIO access on this kiosk.  Usage: sudo kiosk-gpio-check
+KIOSK_USER="KIOSKUSER_PLACEHOLDER"
+GPIO_GROUP="GPIOGROUP_PLACEHOLDER"
+GPIO_MODULE="GPIOMODULE_PLACEHOLDER"
+
+echo "== kernel module =="
+lsmod | grep -q "${GPIO_MODULE//-/_}" \
+  && echo "  $GPIO_MODULE loaded" \
+  || echo "  $GPIO_MODULE NOT loaded  ->  dmesg | grep -i it87"
+
+echo "== chip nodes =="
+ls -l /dev/gpiochip* 2>/dev/null || echo "  none — the driver did not bind"
+command -v gpiodetect >/dev/null && gpiodetect 2>/dev/null
+
+echo "== group membership (passwd database) =="
+id "$KIOSK_USER"
+
+echo "== group membership of the RUNNING app (this is what matters) =="
+pid=$(systemctl --user -M "${KIOSK_USER}@" show kiosk-app.service -p MainPID --value 2>/dev/null)
+if [[ -n "$pid" && "$pid" != "0" ]]; then
+    gid=$(getent group "$GPIO_GROUP" | cut -d: -f3)
+    groups_line=$(grep '^Groups:' "/proc/$pid/status" 2>/dev/null)
+    echo "  pid $pid  $groups_line"
+    echo "  $GPIO_GROUP gid = $gid"
+    if [[ " $(echo "$groups_line" | cut -d: -f2) " == *" $gid "* ]]; then
+        echo "  OK — the app has the $GPIO_GROUP group"
+    else
+        echo "  MISSING — run: loginctl terminate-user $KIOSK_USER   (or reboot)"
+    fi
+else
+    echo "  app not running"
+fi
+
+echo "== can the kiosk user actually open the chip? =="
+if sudo -u "$KIOSK_USER" test -r /dev/gpiochip0 && sudo -u "$KIOSK_USER" test -w /dev/gpiochip0; then
+    echo "  yes"
+else
+    echo "  NO — check /etc/udev/rules.d/99-gpio.rules and group membership above"
+fi
+
+echo "== who is holding the lines? =="
+# A stray 'ngpio watch' left running over SSH makes the app's open() return
+# EBUSY. gpioinfo shows the consumer label of every claimed line.
+command -v gpioinfo >/dev/null && gpioinfo 2>/dev/null | grep -E 'ngpio|used' | head -20
+EOF
+sed -i "s#KIOSKUSER_PLACEHOLDER#${KIOSK_USER}#"   /usr/local/bin/kiosk-gpio-check
+sed -i "s#GPIOGROUP_PLACEHOLDER#${GPIO_GROUP}#"   /usr/local/bin/kiosk-gpio-check
+sed -i "s#GPIOMODULE_PLACEHOLDER#${GPIO_MODULE}#" /usr/local/bin/kiosk-gpio-check
+chmod 755 /usr/local/bin/kiosk-gpio-check
+chown root:root /usr/local/bin/kiosk-gpio-check
+
+# ============================================================================
 say "Installing the per-device first-setup helper (for cloned machines)"
 cat > /usr/local/bin/first-setup <<'EOF'
 #!/bin/bash
@@ -675,13 +814,17 @@ say "DONE. Summary:"
 cat <<EOF
 
   Kiosk user .......... ${KIOSK_USER}  (no sudo, autologin on tty1)
-                        member of 'uucp' -> RS485 / serial port access
+                        group 'uucp'         -> RS485 / serial port access
+                        group '${GPIO_GROUP}'         -> /dev/gpiochip* digital IO
   Admin user .......... ${ADMIN_USER}  (full sudo)
   App ................. ${APP_DIR}/${APP_BINARY}  (systemd user service)
                         Restart=always + no start-limit -> UN-KILLABLE
   Source .............. ${APP_REPO:-${APP_SRC:-<pre-placed in APP_DIR>}}
   Branch .............. ${APP_BRANCH:-<repo default>}${APP_COMMIT:+  (pinned @ ${APP_COMMIT})}
                         recorded in ${APP_DIR}/.deployed-version
+  GPIO ................ module '${GPIO_MODULE}' (loads at boot)
+                        udev: /dev/gpiochip* -> root:${GPIO_GROUP} 0660
+                        terminals 1-8 = gpiochip0 lines 48-55
   F12 menu ............ Restart App | Reboot System   (nothing else)
   Ctrl+Alt+C .......... Chrome
   Ctrl+Alt+R .......... RustDesk
@@ -694,6 +837,7 @@ cat <<EOF
   Configs ............. root-owned, kiosk cannot edit or delete
   first-setup ......... /usr/local/bin/first-setup       (run once per cloned device)
   kiosk-update-app .... /usr/local/bin/kiosk-update-app  (re-deploy another branch)
+  kiosk-gpio-check .... /usr/local/bin/kiosk-gpio-check  (diagnose dead digital IO)
 
   NEXT:
     1) reboot
@@ -701,13 +845,18 @@ cat <<EOF
     3) test: F12 -> Restart App;  Alt+F4 on the app (should NOT close);
              Ctrl+Alt+T -> Admin User (should ask for password)
     4) RS485: Settings -> RS485 -> enter port/baud/parity for this device
-    5) to STOP the app for maintenance: open a Terminal (password required),
+    5) GPIO:  sudo kiosk-gpio-check     (every line should say OK)
+              sudo -u ${KIOSK_USER} ngpio show    (must work WITHOUT sudo)
+    6) to STOP the app for maintenance: open a Terminal (password required),
        then:  systemctl --user stop kiosk-app.service
-    6) to deploy a new branch later:  sudo kiosk-update-app <branch>
-    7) (optional hardening, do LAST) block TTY switching:
+    7) to deploy a new branch later:  sudo kiosk-update-app <branch>
+    8) (optional hardening, do LAST) block TTY switching:
          create /etc/X11/xorg.conf.d/10-kiosk.conf with DontVTSwitch/DontZap
 
-  Reboot now?
 EOF
-read -p "  [y/N] " ans
+warn "The kiosk user's group memberships (uucp, ${GPIO_GROUP}) only reach the running"
+warn "app after a full reboot — a systemd --user manager cannot change its own"
+warn "supplementary groups. Reboot before testing serial or GPIO."
+echo ""
+read -p "  Reboot now? [y/N] " ans
 [[ "$ans" == "y" || "$ans" == "Y" ]] && reboot || echo "Reboot later with: sudo reboot"
