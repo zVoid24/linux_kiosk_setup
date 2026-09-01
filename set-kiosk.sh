@@ -160,11 +160,49 @@ pacman -Syu --noconfirm
 pacman -S --needed --noconfirm \
     xorg-server xorg-xinit xorg-xset xorg-xhost \
     openbox rofi chromium pcmanfm \
-    xterm xdotool ttf-dejavu git base-devel libgpiod
+    xterm xdotool ttf-dejavu git base-devel libgpiod udisks2 ntfs-3g
 # NOTE: xdotool powers the "protect the Modbus window from Alt+F4" guard in
 # STEP 11. libgpiod is NOT used by the app (it talks to the chardev ioctl ABI
 # directly) — it is installed for gpiodetect/gpioinfo, which are the fastest
-# way to debug a dead GPIO on-site.
+# way to debug a dead GPIO on-site. udisks2 provides `udisksctl`, which
+# usb_drive_service.dart shells out to for mounting removable drives — this
+# kiosk has no desktop shell (gvfs/udiskie/Nautilus) to auto-mount USB sticks
+# on insertion, so without udisks2 the app sees the block device (lsblk still
+# works, it just reads sysfs) but never gets a mount point and reports no USB.
+# ntfs-3g is needed alongside it — see the mount_options.conf provisioning
+# below for why the in-kernel ntfs3 driver alone isn't enough.
+
+# udisks2 is D-Bus-activatable, but enabling it outright avoids relying on
+# activation timing for something the app depends on every time.
+systemctl enable --now udisks2
+
+# A USB stick that gets yanked mid-export (no eject button on this kiosk)
+# leaves NTFS's dirty bit set. udisks2 picks the in-kernel `ntfs3` driver by
+# default when it's available, and ntfs3 refuses to mount a dirty volume at
+# all unless given `force` — but `force` isn't a recognized option for the
+# ntfs3 entry in udisks2's mount-option table, so it's rejected with
+# OptionNotPermitted *no matter what* mount_options.conf allows; there is no
+# way to pass it through udisksctl. ntfs-3g (FUSE), by contrast,
+# auto-recovers a dirty volume by default with no extra options needed.
+# Reordering `ntfs_drivers` below to prefer the already-installed ntfs-3g
+# over ntfs3 fixes this outright — verified by hand: an NTFS stick left
+# dirty by an unclean removal mounted and accepted writes immediately, no
+# reformat needed.
+install -d -m 755 /etc/udisks2
+cat > /etc/udisks2/mount_options.conf <<'EOF'
+[defaults]
+allow=exec,noexec,nodev,nosuid,atime,noatime,nodiratime,relatime,strictatime,lazytime,ro,rw,sync,dirsync,noload,acl,nosymfollow
+
+ntfs:ntfs_defaults=uid=$UID,gid=$GID,windows_names
+ntfs:ntfs_allow=uid=$UID,gid=$GID,umask,dmask,fmask,locale,norecover,ignore_case,windows_names,compression,nocompression,big_writes,recover,remove_hiberfile
+
+ntfs:ntfs3_defaults=uid=$UID,gid=$GID
+ntfs:ntfs3_allow=uid=$UID,gid=$GID,umask,dmask,fmask,iocharset,discard,nodiscard,sparse,nosparse,hidden,nohidden,sys_immutable,nosys_immutable,showmeta,noshowmeta,prealloc,noprealloc,hide_dot_files,nohide_dot_files,windows_names,nocase,case
+
+ntfs_drivers=ntfs,ntfs3
+EOF
+# udisks2 only reads this file at daemon start, not on file change.
+systemctl restart udisks2
 
 # ============================================================================
 say "STEP 2/14  Ensuring yay (AUR helper) is installed"
