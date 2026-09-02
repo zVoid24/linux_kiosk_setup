@@ -30,6 +30,12 @@
 #   Neither needs sudo at runtime, which matters because the kiosk user has none.
 #
 # ---------------------------------------------------------------------------
+# BOOT BRANDING:
+#   STEP 15 replaces the boot splash with the logo shipped inside the app
+#   bundle ($APP_DIR/$SPLASH_LOGO). Nothing to do by hand — put logo.png in the
+#   app repo root and it gets picked up. Re-brand later with:  sudo set-splash
+#
+# ---------------------------------------------------------------------------
 # CONTROLS AFTER SETUP:
 #   F12 ............. Kiosk menu:  Restart App | Reboot System   (that's all)
 #   Ctrl+Alt+C ...... Open Chrome
@@ -95,6 +101,18 @@ GPIO_MODULE="gpio-it87"
 # Group that owns /dev/gpiochip*. Arch does not ship a 'gpio' group, so this
 # script creates it.
 GPIO_GROUP="gpio"
+
+# ---- Boot splash (custom boot logo) ----------------------------------------
+# The logo is read from the app bundle, NOT from this script, so a new app
+# release can re-brand the boot screen without touching setup-kiosk.sh.
+# Put the file in the repo root as logo.png and it is picked up automatically.
+#   Set SPLASH_LOGO="" to skip the boot splash entirely.
+SPLASH_LOGO="logo.png"      # filename inside $APP_DIR
+SPLASH_THEME="mylogo"       # plymouth theme name (cloned from 'spinner')
+SPLASH_WIDTH="400"          # rendered logo width in px; keep <= half the panel
+
+# Show the cube spinner animation under the logo? "no" = logo on black only.
+SPLASH_ANIMATION="yes"
 ##############################################################################
 
 # ---- helpers ---------------------------------------------------------------
@@ -111,7 +129,7 @@ KIOSK_HOME="/home/${KIOSK_USER}"
 # ---- ensure the admin (sudo) user exists -----------------------------------
 # The AUR builds (yay, rustdesk) must run as a NON-root user with sudo, because
 # makepkg refuses to run as root. So we guarantee $ADMIN_USER exists and has sudo.
-say "STEP 0/14  Ensuring admin user '$ADMIN_USER' exists with sudo"
+say "STEP 0/15  Ensuring admin user '$ADMIN_USER' exists with sudo"
 
 # make sure sudo + the wheel sudoers rule are in place
 pacman -S --needed --noconfirm sudo
@@ -155,12 +173,13 @@ else
 fi
 
 # ============================================================================
-say "STEP 1/14  Installing official packages"
+say "STEP 1/15  Installing official packages"
 pacman -Syu --noconfirm
 pacman -S --needed --noconfirm \
     xorg-server xorg-xinit xorg-xset xorg-xhost \
     openbox rofi chromium pcmanfm \
-    xterm xdotool ttf-dejavu git base-devel libgpiod udisks2 ntfs-3g
+    xterm xdotool ttf-dejavu git base-devel libgpiod udisks2 ntfs-3g \
+    plymouth imagemagick
 # NOTE: xdotool powers the "protect the Modbus window from Alt+F4" guard in
 # STEP 11. libgpiod is NOT used by the app (it talks to the chardev ioctl ABI
 # directly) — it is installed for gpiodetect/gpioinfo, which are the fastest
@@ -171,6 +190,8 @@ pacman -S --needed --noconfirm \
 # works, it just reads sysfs) but never gets a mount point and reports no USB.
 # ntfs-3g is needed alongside it — see the mount_options.conf provisioning
 # below for why the in-kernel ntfs3 driver alone isn't enough.
+# plymouth + imagemagick drive the custom boot splash in STEP 15; imagemagick
+# is also what set-splash uses later to re-brand without a reinstall.
 
 # udisks2 is D-Bus-activatable, but enabling it outright avoids relying on
 # activation timing for something the app depends on every time.
@@ -205,7 +226,7 @@ EOF
 systemctl restart udisks2
 
 # ============================================================================
-say "STEP 2/14  Ensuring yay (AUR helper) is installed"
+say "STEP 2/15  Ensuring yay (AUR helper) is installed"
 
 # makepkg runs 'sudo pacman' internally to install built packages. Since this
 # script runs unattended, grant admin TEMPORARY passwordless sudo for the build,
@@ -231,7 +252,7 @@ else
 fi
 
 # ============================================================================
-say "STEP 3/14  Installing RustDesk (from AUR)"
+say "STEP 3/15  Installing RustDesk (from AUR)"
 if ! command -v rustdesk &>/dev/null; then
     sudo -u "$ADMIN_USER" yay -S --noconfirm rustdesk-bin
 else
@@ -243,7 +264,7 @@ cleanup_tmp_sudo
 trap - EXIT
 
 # ============================================================================
-say "STEP 4/14  Creating locked-down kiosk user"
+say "STEP 4/15  Creating locked-down kiosk user"
 if ! id "$KIOSK_USER" &>/dev/null; then
     useradd -m -s /bin/bash "$KIOSK_USER"
     echo "Created user '$KIOSK_USER' (NOT in wheel group -> no sudo)."
@@ -293,7 +314,7 @@ else
 fi
 
 # ============================================================================
-say "STEP 5/14  Deploying the Flutter app to $APP_DIR"
+say "STEP 5/15  Deploying the Flutter app to $APP_DIR"
 mkdir -p "$APP_DIR"
 if [[ -n "$APP_REPO" ]]; then
     # clone the bundle from git into a temp dir, then copy its contents in
@@ -350,7 +371,7 @@ chmod +x "${APP_DIR}/${APP_BINARY}" 2>/dev/null || true
 [[ -x "${APP_DIR}/${APP_BINARY}" ]] || warn "Binary ${APP_DIR}/${APP_BINARY} not found/executable — check APP_BINARY."
 
 # ============================================================================
-say "STEP 6/14  Configuring autologin on tty1"
+say "STEP 6/15  Configuring autologin on tty1"
 mkdir -p /etc/systemd/system/getty@tty1.service.d
 cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf <<EOF
 [Service]
@@ -359,7 +380,7 @@ ExecStart=-/usr/bin/agetty --autologin ${KIOSK_USER} --noclear %I \$TERM
 EOF
 
 # ============================================================================
-say "STEP 7/14  Writing .bash_profile (auto-start X, cursor VISIBLE)"
+say "STEP 7/15  Writing .bash_profile (auto-start X, cursor VISIBLE)"
 cat > "${KIOSK_HOME}/.bash_profile" <<'EOF'
 [[ -f ~/.bashrc ]] && . ~/.bashrc
 
@@ -372,7 +393,7 @@ fi
 EOF
 
 # ---- .xinitrc (cursor visible: no -nocursor, no unclutter) ----
-say "STEP 8/14  Writing .xinitrc (starts app service + gives root display access for RustDesk)"
+say "STEP 8/15  Writing .xinitrc (starts app service + gives root display access for RustDesk)"
 cat > "${KIOSK_HOME}/.xinitrc" <<'EOF'
 #!/bin/bash
 # Tell apps this is an X11 session. Because we start X with startx (no display
@@ -381,6 +402,11 @@ cat > "${KIOSK_HOME}/.xinitrc" <<'EOF'
 export XDG_SESSION_TYPE=x11
 export XDG_SESSION_DESKTOP=openbox
 export XDG_CURRENT_DESKTOP=openbox
+
+# Make sure the boot splash is gone before X takes the framebuffer. Normally
+# plymouth has already quit by multi-user.target, so this is a no-op — but if
+# it is somehow still holding DRM master, X would fail to start.
+command -v plymouth >/dev/null && plymouth quit 2>/dev/null || true
 
 # Disable screen blanking / power saving
 xset s off
@@ -399,7 +425,7 @@ exec openbox-session
 EOF
 
 # ============================================================================
-say "STEP 9/14  Creating the app systemd USER service (UN-KILLABLE, auto-restart)"
+say "STEP 9/15  Creating the app systemd USER service (UN-KILLABLE, auto-restart)"
 mkdir -p "${KIOSK_HOME}/.config/systemd/user"
 # StartLimitIntervalSec=0 disables systemd's default "give up after 5 restarts
 # in 10s" rate limit, so the Modbus app is relaunched forever no matter what.
@@ -436,7 +462,7 @@ EOF
 loginctl enable-linger "${KIOSK_USER}"
 
 # ============================================================================
-say "STEP 10/14  Openbox config (F12 menu + app keybinds + protected Alt+F4)"
+say "STEP 10/15  Openbox config (F12 menu + app keybinds + protected Alt+F4)"
 mkdir -p "${KIOSK_HOME}/.config/openbox"
 cat > "${KIOSK_HOME}/.config/openbox/rc.xml" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -496,7 +522,7 @@ cat > "${KIOSK_HOME}/.config/openbox/rc.xml" <<EOF
 EOF
 
 # ============================================================================
-say "STEP 11/14  Menu scripts (F12 menu, password-gated Terminal, close-guard)"
+say "STEP 11/15  Menu scripts (F12 menu, password-gated Terminal, close-guard)"
 
 # ---- F12 menu: ONLY Restart App + Reboot ----------------------------------
 cat > /usr/local/bin/kiosk-menu <<'EOF'
@@ -576,7 +602,7 @@ chmod 440 /etc/sudoers.d/kiosk-reboot
 visudo -cf /etc/sudoers.d/kiosk-reboot >/dev/null || die "sudoers rule invalid"
 
 # ============================================================================
-say "STEP 12/14  GPIO: Super-I/O driver + /dev/gpiochip* permissions"
+say "STEP 12/15  GPIO: Super-I/O driver + /dev/gpiochip* permissions"
 
 # ---- kernel module ---------------------------------------------------------
 # The IT8786 GPIO controller is not probed automatically — it needs gpio-it87.
@@ -627,7 +653,7 @@ else
 fi
 
 # ============================================================================
-say "STEP 13/14  RustDesk background service (unkillable, auto-restart)"
+say "STEP 13/15  RustDesk background service (unkillable, auto-restart)"
 # enable whatever the service is actually called
 RD_UNIT=$(systemctl list-unit-files 2>/dev/null | awk '/rustdesk/{print $1}' | head -n1 || true)
 if [[ -n "${RD_UNIT:-}" ]]; then
@@ -646,7 +672,7 @@ else
 fi
 
 # ============================================================================
-say "STEP 14/14  Pre-creating writable app-config dirs, then LOCKING everything down"
+say "STEP 14/15  Pre-creating writable app-config dirs, then LOCKING everything down"
 
 # Writable sandboxes so chromium / pcmanfm don't crash on first launch.
 # IMPORTANT: chromium needs BOTH ~/.config/chromium (profile) AND
@@ -709,6 +735,221 @@ chmod -R 755 "${KIOSK_HOME}/.config/chromium" "${KIOSK_HOME}/.cache"
 echo "Chromium profile + cache dirs created and owned by ${KIOSK_USER}."
 
 # ============================================================================
+say "STEP 15/15  Custom boot splash (logo from the app bundle)"
+
+# The logo ships INSIDE the app bundle (cloned in STEP 5), so a new app release
+# can re-brand the boot screen with no change to this script. If the file is
+# missing, the splash is skipped — a missing logo must never fail the install.
+SPLASH_SRC="${APP_DIR}/${SPLASH_LOGO}"
+
+if [[ -z "$SPLASH_LOGO" ]]; then
+    echo "SPLASH_LOGO is empty — boot splash deliberately disabled."
+elif [[ ! -f "$SPLASH_SRC" ]]; then
+    warn "No '${SPLASH_LOGO}' found in ${APP_DIR} — skipping the boot splash."
+    warn "Add ${SPLASH_LOGO} to the app repo root, or set one later with:"
+    warn "    sudo set-splash /path/to/logo.png"
+else
+    # ---- panel resolution -------------------------------------------------
+    # Read the real framebuffer instead of assuming. systemd-stub CENTRES the
+    # splash rather than scaling it, so a wrong size shows up small/off-centre.
+    if [[ -r /sys/class/graphics/fb0/virtual_size ]]; then
+        IFS=, read -r FB_W FB_H < /sys/class/graphics/fb0/virtual_size
+    else
+        FB_W=1024 FB_H=768
+        warn "Could not read /sys/class/graphics/fb0/virtual_size — assuming ${FB_W}x${FB_H}"
+    fi
+    echo "Panel resolution .... ${FB_W}x${FB_H}"
+    echo "Logo source ......... ${SPLASH_SRC}"
+
+    # ---- theme ------------------------------------------------------------
+    # Derived from 'spinner' (ships with plymouth) so its animation frames and
+    # keymap/lock assets come along; only the watermark is swapped. Rebuilt from
+    # scratch each run so a re-run can't leave a half-edited theme behind.
+    THEME_DIR="/usr/share/plymouth/themes/${SPLASH_THEME}"
+    if [[ ! -d /usr/share/plymouth/themes/spinner ]]; then
+        warn "plymouth's 'spinner' theme is missing — cannot build '${SPLASH_THEME}'."
+    else
+        rm -rf "$THEME_DIR"
+        cp -r /usr/share/plymouth/themes/spinner "$THEME_DIR"
+        mv "${THEME_DIR}/spinner.plymouth" "${THEME_DIR}/${SPLASH_THEME}.plymouth"
+        THEME_FILE="${THEME_DIR}/${SPLASH_THEME}.plymouth"
+        sed -i "s/^Name=.*/Name=${SPLASH_THEME}/; s|spinner|${SPLASH_THEME}|g" "$THEME_FILE"
+
+        # spinner pins the watermark to the bottom edge (.96) because it treats
+        # it as a small distro badge. Centre it, and push the cube throbber down
+        # to .85 so the two don't overlap.
+        sed -i "s/^WatermarkVerticalAlignment=.*/WatermarkVerticalAlignment=.5/" "$THEME_FILE"
+        sed -i "s/^WatermarkHorizontalAlignment=.*/WatermarkHorizontalAlignment=.5/" "$THEME_FILE"
+        sed -i "s/^VerticalAlignment=.7$/VerticalAlignment=.85/" "$THEME_FILE"
+
+        if [[ "$SPLASH_ANIMATION" != "yes" ]]; then
+            # Logo on plain black. two-step tolerates missing frames — it logs
+            # "optional progress animation wouldn't load" and carries on.
+            rm -f "${THEME_DIR}"/animation-*.png "${THEME_DIR}"/throbber-*.png
+            echo "Animation ........... disabled (logo on black)"
+        else
+            echo "Animation ........... spinner cubes kept"
+        fi
+
+        # ---- images -------------------------------------------------------
+        # Alpha is flattened onto black EXPLICITLY: '-alpha remove' without a
+        # stated -background picks white, which is what makes a transparent
+        # logo come out wrong.
+        magick "$SPLASH_SRC" -resize "${SPLASH_WIDTH}x" \
+            -background black -alpha remove -alpha off -strip \
+            "${THEME_DIR}/watermark.png" \
+            || warn "watermark conversion failed — is ${SPLASH_LOGO} a valid image?"
+
+        # systemd-stub's splash must be 24-bit BMP3. 32-bit BMP or PNG is
+        # rejected, and it fails silently (no splash, no error).
+        magick -size "${FB_W}x${FB_H}" xc:black \
+            \( "$SPLASH_SRC" -resize "${SPLASH_WIDTH}x" -background black -alpha remove -alpha off \) \
+            -gravity center -composite \
+            -alpha off -type TrueColor -define bmp:format=bmp3 \
+            /boot/splash.bmp \
+            || warn "stub splash conversion failed"
+
+        # ---- mkinitcpio hook ----------------------------------------------
+        # Must sit immediately after udev (or after systemd, as sd-plymouth).
+        # Guarded so a re-run can't insert it twice.
+        if ! grep -q '^HOOKS=.*plymouth' /etc/mkinitcpio.conf; then
+            if grep -q '^HOOKS=(base systemd ' /etc/mkinitcpio.conf; then
+                sed -i 's/^HOOKS=(base systemd /HOOKS=(base systemd sd-plymouth /' /etc/mkinitcpio.conf
+            else
+                sed -i 's/^HOOKS=(base udev /HOOKS=(base udev plymouth /' /etc/mkinitcpio.conf
+            fi
+        fi
+        grep -q '^HOOKS=.*plymouth' /etc/mkinitcpio.conf \
+            || warn "Could not add the plymouth hook — fix HOOKS= in /etc/mkinitcpio.conf by hand"
+
+        # ---- kernel cmdline -----------------------------------------------
+        # plymouthd exits immediately unless 'splash' is on the cmdline, and
+        # 'quiet' is what stops kernel messages painting over the logo. WHERE
+        # this belongs depends on how the box boots, so detect it.
+        SPLASH_ARGS="quiet splash loglevel=3 rd.udev.log_level=3 vt.global_cursor_default=0 logo.nologo"
+
+        if grep -qs '^default_uki=' /etc/mkinitcpio.d/linux.preset; then
+            echo "Boot type ........... unified kernel image (cmdline baked in)"
+            # seed from the running cmdline if the file doesn't exist yet
+            [[ -f /etc/kernel/cmdline ]] || tr -d '\n' < /proc/cmdline > /etc/kernel/cmdline
+            CMDLINE="$(tr -d '\n' < /etc/kernel/cmdline)"
+            for arg in $SPLASH_ARGS; do
+                grep -qw -- "${arg%%=*}" <<< "$CMDLINE" || CMDLINE="${CMDLINE} ${arg}"
+            done
+            printf '%s\n' "$CMDLINE" > /etc/kernel/cmdline
+            chmod 644 /etc/kernel/cmdline
+
+            # Point the UKI build at our splash. The preset ships a
+            # default_options with --splash aimed at Arch's stock logo, so
+            # REPLACE it — a second default_options line would just be
+            # overridden, since the preset is sourced as a shell script.
+            if grep -q '^default_options=' /etc/mkinitcpio.d/linux.preset; then
+                sed -i 's|^default_options=.*|default_options="--splash /boot/splash.bmp"|' \
+                    /etc/mkinitcpio.d/linux.preset
+            else
+                echo 'default_options="--splash /boot/splash.bmp"' >> /etc/mkinitcpio.d/linux.preset
+            fi
+            echo "cmdline ............. $CMDLINE"
+
+        elif [[ -f /etc/default/grub ]]; then
+            echo "Boot type ........... GRUB + separate initramfs"
+            for arg in $SPLASH_ARGS; do
+                grep -q "^GRUB_CMDLINE_LINUX_DEFAULT=.*${arg%%=*}" /etc/default/grub \
+                    || sed -i "s|^\(GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\)\"|\1 ${arg}\"|" \
+                       /etc/default/grub
+            done
+            # hand the same framebuffer to the kernel so the image survives
+            grep -q '^GRUB_GFXPAYLOAD_LINUX=' /etc/default/grub \
+                || echo 'GRUB_GFXPAYLOAD_LINUX=keep' >> /etc/default/grub
+            grub-mkconfig -o /boot/grub/grub.cfg || warn "grub-mkconfig failed"
+
+        else
+            warn "Found neither a UKI preset nor /etc/default/grub."
+            warn "Add this to your bootloader's kernel line by hand:"
+            warn "    ${SPLASH_ARGS}"
+        fi
+
+        # ---- activate -----------------------------------------------------
+        # -R rebuilds the initramfs/UKI, which is what actually ships the theme.
+        # Editing /usr/share alone changes nothing at boot.
+        plymouth-set-default-theme -R "$SPLASH_THEME" \
+            || warn "plymouth-set-default-theme failed — the splash will not show"
+
+        echo "Boot splash installed (theme '${SPLASH_THEME}', logo ${SPLASH_WIDTH}px wide)."
+    fi
+fi
+
+# ============================================================================
+say "Installing the splash re-branding helper"
+# Swap the boot logo later without re-running this whole script.
+cat > /usr/local/bin/set-splash <<'EOF'
+#!/usr/bin/env bash
+# Swap this kiosk's boot logo (plymouth watermark + systemd-stub splash).
+#   sudo set-splash /path/to/logo.png [width]
+# Defaults to the width baked in at install time. Rebuilds the initramfs/UKI,
+# so it takes ~20s. Previous images are kept in /var/backups/splash.
+set -euo pipefail
+
+THEME="THEME_PLACEHOLDER"
+DEFAULT_WIDTH="WIDTH_PLACEHOLDER"
+APP_DIR="APPDIR_PLACEHOLDER"
+SPLASH_LOGO="LOGO_PLACEHOLDER"
+
+THEME_DIR="/usr/share/plymouth/themes/${THEME}"
+BACKUP_DIR="/var/backups/splash"
+
+die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[36m==>\033[0m %s\n' "$*"; }
+
+[[ $EUID -eq 0 ]] || die "run as root: sudo set-splash <image> [width]"
+
+# default to the logo already in the app bundle when called with no argument
+SRC="${1:-${APP_DIR}/${SPLASH_LOGO}}"
+WIDTH="${2:-$DEFAULT_WIDTH}"
+
+[[ -f "$SRC" ]]            || die "no such file: $SRC"
+[[ -d "$THEME_DIR" ]]      || die "theme dir missing: $THEME_DIR"
+[[ "$WIDTH" =~ ^[0-9]+$ ]] || die "width must be a number, got: $WIDTH"
+command -v magick >/dev/null || die "imagemagick not installed"
+magick identify "$SRC" >/dev/null 2>&1 || die "not a readable image: $SRC"
+
+if [[ -r /sys/class/graphics/fb0/virtual_size ]]; then
+    IFS=, read -r FB_W FB_H < /sys/class/graphics/fb0/virtual_size
+else
+    FB_W=1024 FB_H=768
+fi
+info "screen ${FB_W}x${FB_H}, logo ${WIDTH}px wide, source $SRC"
+
+mkdir -p "$BACKUP_DIR"
+STAMP=$(date +%Y%m%d-%H%M%S)
+[[ -f "$THEME_DIR/watermark.png" ]] && cp "$THEME_DIR/watermark.png" "$BACKUP_DIR/watermark-${STAMP}.png"
+[[ -f /boot/splash.bmp ]]           && cp /boot/splash.bmp           "$BACKUP_DIR/splash-${STAMP}.bmp"
+info "previous images backed up to $BACKUP_DIR"
+
+magick "$SRC" -resize "${WIDTH}x" \
+    -background black -alpha remove -alpha off -strip \
+    "$THEME_DIR/watermark.png"
+
+magick -size "${FB_W}x${FB_H}" xc:black \
+    \( "$SRC" -resize "${WIDTH}x" -background black -alpha remove -alpha off \) \
+    -gravity center -composite \
+    -alpha off -type TrueColor -define bmp:format=bmp3 \
+    /boot/splash.bmp
+
+magick identify "$THEME_DIR/watermark.png" /boot/splash.bmp
+
+info "rebuilding initramfs + UKI"
+plymouth-set-default-theme -R "$THEME"
+info "done — reboot to see it"
+EOF
+sed -i "s#THEME_PLACEHOLDER#${SPLASH_THEME}#"  /usr/local/bin/set-splash
+sed -i "s#WIDTH_PLACEHOLDER#${SPLASH_WIDTH}#"  /usr/local/bin/set-splash
+sed -i "s#APPDIR_PLACEHOLDER#${APP_DIR}#"      /usr/local/bin/set-splash
+sed -i "s#LOGO_PLACEHOLDER#${SPLASH_LOGO}#"    /usr/local/bin/set-splash
+chmod 755 /usr/local/bin/set-splash
+chown root:root /usr/local/bin/set-splash
+
+# ============================================================================
 say "Installing the app updater helper (re-deploy a different branch later)"
 cat > /usr/local/bin/kiosk-update-app <<'EOF'
 #!/bin/bash
@@ -722,10 +963,16 @@ APP_REPO="REPO_PLACEHOLDER"
 APP_DIR="APPDIR_PLACEHOLDER"
 APP_BINARY="BINARY_PLACEHOLDER"
 KIOSK_USER="KIOSKUSER_PLACEHOLDER"
+SPLASH_LOGO="LOGO_PLACEHOLDER"
 BRANCH="${1:-BRANCH_PLACEHOLDER}"
 COMMIT="${2:-}"
 
 [[ -n "$APP_REPO" ]] || { echo "This kiosk was not deployed from git — nothing to update."; exit 1; }
+
+# remember the old logo so we only rebuild the splash if the new release
+# actually changed it (the rebuild costs ~20s, so skip it when pointless)
+OLD_LOGO_SUM=""
+[[ -f "${APP_DIR}/${SPLASH_LOGO}" ]] && OLD_LOGO_SUM=$(sha256sum "${APP_DIR}/${SPLASH_LOGO}" | cut -d' ' -f1)
 
 TMP="$(mktemp -d)"
 echo "==> cloning $APP_REPO (branch: $BRANCH)"
@@ -756,12 +1003,24 @@ echo "==> starting app"
 su - "$KIOSK_USER" -c 'systemctl --user start kiosk-app.service' 2>/dev/null \
   || systemctl --user -M "${KIOSK_USER}@" start kiosk-app.service 2>/dev/null || true
 
+# refresh the boot splash only if this release shipped a different logo
+if [[ -n "$SPLASH_LOGO" && -f "${APP_DIR}/${SPLASH_LOGO}" ]] && command -v set-splash >/dev/null; then
+    NEW_LOGO_SUM=$(sha256sum "${APP_DIR}/${SPLASH_LOGO}" | cut -d' ' -f1)
+    if [[ "$NEW_LOGO_SUM" != "$OLD_LOGO_SUM" ]]; then
+        echo "==> ${SPLASH_LOGO} changed in this release — refreshing the boot splash"
+        set-splash "${APP_DIR}/${SPLASH_LOGO}" || echo "!!  splash refresh failed (app is fine)"
+    else
+        echo "==> boot logo unchanged — splash left alone"
+    fi
+fi
+
 echo "Updated to $BRANCH @ $REF.  Previous version kept at ${APP_DIR}.old"
 EOF
 sed -i "s#REPO_PLACEHOLDER#${APP_REPO}#"        /usr/local/bin/kiosk-update-app
 sed -i "s#APPDIR_PLACEHOLDER#${APP_DIR}#"       /usr/local/bin/kiosk-update-app
 sed -i "s#BINARY_PLACEHOLDER#${APP_BINARY}#"    /usr/local/bin/kiosk-update-app
 sed -i "s#KIOSKUSER_PLACEHOLDER#${KIOSK_USER}#" /usr/local/bin/kiosk-update-app
+sed -i "s#LOGO_PLACEHOLDER#${SPLASH_LOGO}#"     /usr/local/bin/kiosk-update-app
 sed -i "s#BRANCH_PLACEHOLDER#${APP_BRANCH:-main}#" /usr/local/bin/kiosk-update-app
 chmod 755 /usr/local/bin/kiosk-update-app
 chown root:root /usr/local/bin/kiosk-update-app
@@ -863,6 +1122,10 @@ cat <<EOF
   GPIO ................ module '${GPIO_MODULE}' (loads at boot)
                         udev: /dev/gpiochip* -> root:${GPIO_GROUP} 0660
                         terminals 1-8 = gpiochip0 lines 48-55
+  Boot splash ......... plymouth theme '${SPLASH_THEME}'
+                        logo from ${APP_DIR}/${SPLASH_LOGO} at ${SPLASH_WIDTH}px
+                        stub splash /boot/splash.bmp (shown by systemd-stub)
+                        re-brand later with:  sudo set-splash [image] [width]
   F12 menu ............ Restart App | Reboot System   (nothing else)
   Ctrl+Alt+C .......... Chrome
   Ctrl+Alt+R .......... RustDesk
@@ -876,6 +1139,7 @@ cat <<EOF
   first-setup ......... /usr/local/bin/first-setup       (run once per cloned device)
   kiosk-update-app .... /usr/local/bin/kiosk-update-app  (re-deploy another branch)
   kiosk-gpio-check .... /usr/local/bin/kiosk-gpio-check  (diagnose dead digital IO)
+  set-splash .......... /usr/local/bin/set-splash        (change the boot logo)
 
   NEXT:
     1) reboot
@@ -885,10 +1149,12 @@ cat <<EOF
     4) RS485: Settings -> RS485 -> enter port/baud/parity for this device
     5) GPIO:  sudo kiosk-gpio-check     (every line should say OK)
               sudo -u ${KIOSK_USER} ngpio show    (must work WITHOUT sudo)
-    6) to STOP the app for maintenance: open a Terminal (password required),
+    6) splash: watch the boot — the logo should be centred on black. If it is
+              missing:  journalctl -b -u plymouth-start.service
+    7) to STOP the app for maintenance: open a Terminal (password required),
        then:  systemctl --user stop kiosk-app.service
-    7) to deploy a new branch later:  sudo kiosk-update-app <branch>
-    8) (optional hardening, do LAST) block TTY switching:
+    8) to deploy a new branch later:  sudo kiosk-update-app <branch>
+    9) (optional hardening, do LAST) block TTY switching:
          create /etc/X11/xorg.conf.d/10-kiosk.conf with DontVTSwitch/DontZap
 
 EOF
