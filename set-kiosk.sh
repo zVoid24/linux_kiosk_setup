@@ -30,12 +30,6 @@
 #   Neither needs sudo at runtime, which matters because the kiosk user has none.
 #
 # ---------------------------------------------------------------------------
-# BOOT BRANDING:
-#   STEP 15 replaces the boot splash with the logo shipped inside the app
-#   bundle ($APP_DIR/$SPLASH_LOGO). Nothing to do by hand — put logo.png in the
-#   app repo root and it gets picked up. Re-brand later with:  sudo set-splash
-#
-# ---------------------------------------------------------------------------
 # CONTROLS AFTER SETUP:
 #   F12 ............. Kiosk menu:  Restart App | Reboot System   (that's all)
 #   Ctrl+Alt+C ...... Open Chrome
@@ -44,6 +38,21 @@
 #                     user's PASSWORD before you get a shell.
 #   Alt+F4 .......... Closes admin windows (Chrome/RustDesk/Terminal) only.
 #                     The Modbus app is PROTECTED and can never be closed.
+#
+# ---------------------------------------------------------------------------
+# BOOT BRANDING (STEP 15):
+#   The boot logo is taken from the app bundle ($APP_DIR/$SPLASH_LOGO), so a
+#   new app release re-brands the boot screen with no change to this script.
+#   Re-brand an already-provisioned device with:  sudo set-splash
+#
+# ---------------------------------------------------------------------------
+# devctl (remote support/admin CLI — GPIO config, device/formula/SLD edits,
+# power control): installed automatically from DEVCTL_AUTHORIZED_KEYS below,
+# root-only + SSH-key-verified. Use it via:
+#   ssh -A admin@<device>   then   sudo -E devctl health
+# (this is a comment, so "admin" here is literal — substitute ADMIN_USER's
+# actual value below if you changed it.) See devctl/README.md for the full
+# setup story and troubleshooting.
 ###############################################################################
 
 set -euo pipefail
@@ -108,11 +117,37 @@ GPIO_GROUP="gpio"
 # Put the file in the repo root as logo.png and it is picked up automatically.
 #   Set SPLASH_LOGO="" to skip the boot splash entirely.
 SPLASH_LOGO="logo.png"      # filename inside $APP_DIR
-SPLASH_THEME="mylogo"       # plymouth theme name (cloned from 'spinner')
+SPLASH_THEME="mylogo"       # plymouth theme name (derived from 'spinner')
 SPLASH_WIDTH="400"          # rendered logo width in px; keep <= half the panel
 
-# Show the cube spinner animation under the logo? "no" = logo on black only.
-SPLASH_ANIMATION="yes"
+# Loading indicator shown under the logo while booting:
+#   "cubes" — plymouth's spinner cube animation (stock)
+#   "bar"   — thin progress bar; no image files, cleanest on a panel PC
+#   "dots"  — three pulsing dots, generated in SPLASH_ACCENT below
+#   "none"  — logo on black, no indicator at all
+SPLASH_STYLE="bar"
+
+# Accent colour for the "bar" and "dots" styles. Hex, no alpha.
+SPLASH_ACCENT="#00a3e0"
+
+# ---- devctl (SCUBE internal support/admin CLI) ------------------------------
+# devctl is a separate Go binary for on-site diagnostics/support (GPIO
+# config, device/formula CRUD, SLD editing, power control, etc. — see
+# devctl/README.md). It ships INSIDE the same git bundle as the Flutter app
+# (APP_REPO above), so STEP 5's existing clone already delivers it — no
+# separate fetch step needed. Path is relative to the bundle root.
+DEVCTL_BINARY_REL="devctl-linux-amd64"
+
+# One SSH public key per line (ed25519 recommended) — every developer/admin
+# who should be able to run devctl on THIS device, baked in at provision
+# time. Leave empty to install the binary but skip auth setup entirely (you
+# can still wire it up by hand later per devctl/README.md). Add more keys
+# later without re-running this script: append a line to
+# $KIOSK_HOME/.local/share/com.scube.hybridcontroller/devctl_authorized_keys
+DEVCTL_AUTHORIZED_KEYS=""
+#   e.g.:
+# DEVCTL_AUTHORIZED_KEYS="ssh-ed25519 AAAA... dev1@scube.com.bd
+# ssh-ed25519 AAAA... dev2@scube.com.bd"
 ##############################################################################
 
 # ---- helpers ---------------------------------------------------------------
@@ -405,7 +440,8 @@ export XDG_CURRENT_DESKTOP=openbox
 
 # Make sure the boot splash is gone before X takes the framebuffer. Normally
 # plymouth has already quit by multi-user.target, so this is a no-op — but if
-# it is somehow still holding DRM master, X would fail to start.
+# it were somehow still holding DRM master, X would fail to start and this
+# kiosk would boot to nothing.
 command -v plymouth >/dev/null && plymouth quit 2>/dev/null || true
 
 # Disable screen blanking / power saving
@@ -748,6 +784,9 @@ elif [[ ! -f "$SPLASH_SRC" ]]; then
     warn "No '${SPLASH_LOGO}' found in ${APP_DIR} — skipping the boot splash."
     warn "Add ${SPLASH_LOGO} to the app repo root, or set one later with:"
     warn "    sudo set-splash /path/to/logo.png"
+elif [[ ! -d /usr/share/plymouth/themes/spinner ]]; then
+    warn "plymouth's 'spinner' theme is missing — cannot build '${SPLASH_THEME}'."
+    warn "Check that the plymouth package installed correctly in STEP 1."
 else
     # ---- panel resolution -------------------------------------------------
     # Read the real framebuffer instead of assuming. systemd-stub CENTRES the
@@ -762,120 +801,239 @@ else
     echo "Logo source ......... ${SPLASH_SRC}"
 
     # ---- theme ------------------------------------------------------------
-    # Derived from 'spinner' (ships with plymouth) so its animation frames and
-    # keymap/lock assets come along; only the watermark is swapped. Rebuilt from
-    # scratch each run so a re-run can't leave a half-edited theme behind.
+    # Derived from 'spinner' so its keymap/lock/entry assets come along; only
+    # the watermark is swapped. Rebuilt from scratch each run so a re-run can't
+    # leave a half-edited theme behind.
     THEME_DIR="/usr/share/plymouth/themes/${SPLASH_THEME}"
-    if [[ ! -d /usr/share/plymouth/themes/spinner ]]; then
-        warn "plymouth's 'spinner' theme is missing — cannot build '${SPLASH_THEME}'."
+    rm -rf "$THEME_DIR"
+    cp -r /usr/share/plymouth/themes/spinner "$THEME_DIR"
+    mv "${THEME_DIR}/spinner.plymouth" "${THEME_DIR}/${SPLASH_THEME}.plymouth"
+    THEME_FILE="${THEME_DIR}/${SPLASH_THEME}.plymouth"
+    sed -i "s/^Name=.*/Name=${SPLASH_THEME}/; s|spinner|${SPLASH_THEME}|g" "$THEME_FILE"
+
+    # spinner pins the watermark to the bottom edge (.96) because it treats it
+    # as a small distro badge. Centre it, and push the throbber down to .85 so
+    # the two don't overlap.
+    sed -i "s/^WatermarkVerticalAlignment=.*/WatermarkVerticalAlignment=.5/"   "$THEME_FILE"
+    sed -i "s/^WatermarkHorizontalAlignment=.*/WatermarkHorizontalAlignment=.5/" "$THEME_FILE"
+    sed -i "s/^VerticalAlignment=.7$/VerticalAlignment=.85/"                   "$THEME_FILE"
+
+    # ---- images -----------------------------------------------------------
+    # Alpha is flattened onto black EXPLICITLY: '-alpha remove' without a
+    # stated -background picks white, which is what makes a transparent logo
+    # come out wrong.
+    magick "$SPLASH_SRC" -resize "${SPLASH_WIDTH}x" \
+        -background black -alpha remove -alpha off -strip \
+        "${THEME_DIR}/watermark.png" \
+        || warn "watermark conversion failed — is ${SPLASH_LOGO} a valid image?"
+
+    # systemd-stub's splash must be 24-bit BMP3. A 32-bit BMP or a PNG is
+    # rejected, and it fails silently (no splash, no error message).
+    magick -size "${FB_W}x${FB_H}" xc:black \
+        \( "$SPLASH_SRC" -resize "${SPLASH_WIDTH}x" -background black -alpha remove -alpha off \) \
+        -gravity center -composite \
+        -alpha off -type TrueColor -define bmp:format=bmp3 \
+        /boot/splash.bmp \
+        || warn "stub splash conversion failed"
+
+    # ---- loading indicator ------------------------------------------------
+    # two-step can draw either a frame sequence (throbber-*.png, looped at
+    # ~30fps) or a progress bar, or nothing at all.
+    case "$SPLASH_STYLE" in
+      cubes)
+        echo "Indicator ........... spinner cubes (stock frames)"
+        ;;
+
+      bar)
+        # No image files needed — two-step draws the bar itself. Geometry and
+        # colour live in [two-step], but UseProgressBar is read PER BOOT MODE,
+        # so it has to go under [boot-up] or it is silently ignored.
+        rm -f "${THEME_DIR}"/animation-*.png "${THEME_DIR}"/throbber-*.png
+        BAR_W=$(( FB_W / 3 ))
+        BAR_FG="0x${SPLASH_ACCENT#\#}"
+        sed -i "s/^ProgressBarForegroundColor=.*/ProgressBarForegroundColor=${BAR_FG}/" "$THEME_FILE"
+        sed -i "s/^ProgressBarBackgroundColor=.*/ProgressBarBackgroundColor=0x303030/"  "$THEME_FILE"
+        grep -q '^ProgressBarWidth=' "$THEME_FILE" || \
+          sed -i "/^\[two-step\]/a ProgressBarWidth=${BAR_W}\nProgressBarHeight=4\nProgressBarHorizontalAlignment=.5\nProgressBarVerticalAlignment=.62" "$THEME_FILE"
+        grep -q '^UseProgressBar=true' "$THEME_FILE" || \
+          sed -i "/^\[boot-up\]/a UseProgressBar=true" "$THEME_FILE"
+        echo "Indicator ........... progress bar (${BAR_W}x4, ${SPLASH_ACCENT})"
+        ;;
+
+      dots)
+        # Three dots with the lit one cycling. 10 held frames per state gives a
+        # ~1s loop at plymouth's ~30fps, which reads as a pulse rather than a
+        # flicker. Fewer frames looks frantic.
+        rm -f "${THEME_DIR}"/animation-*.png "${THEME_DIR}"/throbber-*.png
+        DOTS=3; HOLD=10; FW=140; FH=28; SPACING=40; RADIUS=6
+        frame=1
+        for (( active=0; active<DOTS; active++ )); do
+            # build one image, then copy it HOLD times — far cheaper than
+            # invoking magick 30 separate times
+            TMP_FRAME="$(mktemp --suffix=.png)"
+            DRAW=()
+            for (( d=0; d<DOTS; d++ )); do
+                cx=$(( (FW - (DOTS-1)*SPACING)/2 + d*SPACING ))
+                if (( d == active )); then
+                    DRAW+=( -fill "$SPLASH_ACCENT" -draw "circle ${cx},$((FH/2)) $((cx+RADIUS)),$((FH/2))" )
+                else
+                    DRAW+=( -fill "#404040" -draw "circle ${cx},$((FH/2)) $((cx+RADIUS-2)),$((FH/2))" )
+                fi
+            done
+            magick -size "${FW}x${FH}" xc:black "${DRAW[@]}" -alpha off "$TMP_FRAME" \
+                || warn "dot frame generation failed"
+            for (( h=0; h<HOLD; h++ )); do
+                cp "$TMP_FRAME" "$(printf '%s/throbber-%04d.png' "$THEME_DIR" "$frame")"
+                frame=$(( frame + 1 ))
+            done
+            rm -f "$TMP_FRAME"
+        done
+        echo "Indicator ........... $((frame-1)) generated dot frames (${SPLASH_ACCENT})"
+        ;;
+
+      none)
+        rm -f "${THEME_DIR}"/animation-*.png "${THEME_DIR}"/throbber-*.png
+        echo "Indicator ........... none (logo on black)"
+        ;;
+
+      *)
+        warn "Unknown SPLASH_STYLE '${SPLASH_STYLE}' — keeping the stock cubes."
+        ;;
+    esac
+
+    # ---- mkinitcpio hook --------------------------------------------------
+    # Must sit immediately after udev (or after systemd, as sd-plymouth).
+    # Guarded so a re-run can't insert it twice.
+    if ! grep -q '^HOOKS=.*plymouth' /etc/mkinitcpio.conf; then
+        if grep -q '^HOOKS=(base systemd ' /etc/mkinitcpio.conf; then
+            sed -i 's/^HOOKS=(base systemd /HOOKS=(base systemd sd-plymouth /' /etc/mkinitcpio.conf
+        else
+            sed -i 's/^HOOKS=(base udev /HOOKS=(base udev plymouth /' /etc/mkinitcpio.conf
+        fi
+    fi
+    grep -q '^HOOKS=.*plymouth' /etc/mkinitcpio.conf \
+        || warn "Could not add the plymouth hook — fix HOOKS= in /etc/mkinitcpio.conf by hand"
+
+    # ---- kernel cmdline ---------------------------------------------------
+    # plymouthd exits immediately unless 'splash' is on the cmdline, and
+    # 'quiet' is what stops kernel messages painting over the logo. WHERE this
+    # belongs depends on how the box boots, so detect rather than guess.
+    SPLASH_ARGS="quiet splash loglevel=3 rd.udev.log_level=3 vt.global_cursor_default=0 logo.nologo"
+
+    if grep -qs '^default_uki=' /etc/mkinitcpio.d/linux.preset; then
+        echo "Boot type ........... unified kernel image (cmdline baked in)"
+        # seed from the running cmdline if the file doesn't exist yet
+        [[ -f /etc/kernel/cmdline ]] || tr -d '\n' < /proc/cmdline > /etc/kernel/cmdline
+        CMDLINE="$(tr -d '\n' < /etc/kernel/cmdline)"
+        for arg in $SPLASH_ARGS; do
+            grep -qw -- "${arg%%=*}" <<< "$CMDLINE" || CMDLINE="${CMDLINE} ${arg}"
+        done
+        printf '%s\n' "$CMDLINE" > /etc/kernel/cmdline
+        chmod 644 /etc/kernel/cmdline
+
+        # Point the UKI build at our splash. The preset ships a default_options
+        # with --splash aimed at Arch's stock logo, so REPLACE it — a second
+        # default_options line would just be overridden, since the preset is
+        # sourced as a shell script and the last assignment wins.
+        if grep -q '^default_options=' /etc/mkinitcpio.d/linux.preset; then
+            sed -i 's|^default_options=.*|default_options="--splash /boot/splash.bmp"|' \
+                /etc/mkinitcpio.d/linux.preset
+        else
+            echo 'default_options="--splash /boot/splash.bmp"' >> /etc/mkinitcpio.d/linux.preset
+        fi
+        echo "cmdline ............. $CMDLINE"
+
+    elif [[ -f /etc/default/grub ]]; then
+        echo "Boot type ........... GRUB + separate initramfs"
+        for arg in $SPLASH_ARGS; do
+            grep -q "^GRUB_CMDLINE_LINUX_DEFAULT=.*${arg%%=*}" /etc/default/grub \
+                || sed -i "s|^\(GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\)\"|\1 ${arg}\"|" \
+                   /etc/default/grub
+        done
+        # hand the same framebuffer to the kernel so the image survives
+        grep -q '^GRUB_GFXPAYLOAD_LINUX=' /etc/default/grub \
+            || echo 'GRUB_GFXPAYLOAD_LINUX=keep' >> /etc/default/grub
+        grub-mkconfig -o /boot/grub/grub.cfg || warn "grub-mkconfig failed"
+
     else
-        rm -rf "$THEME_DIR"
-        cp -r /usr/share/plymouth/themes/spinner "$THEME_DIR"
-        mv "${THEME_DIR}/spinner.plymouth" "${THEME_DIR}/${SPLASH_THEME}.plymouth"
-        THEME_FILE="${THEME_DIR}/${SPLASH_THEME}.plymouth"
-        sed -i "s/^Name=.*/Name=${SPLASH_THEME}/; s|spinner|${SPLASH_THEME}|g" "$THEME_FILE"
+        warn "Found neither a UKI preset nor /etc/default/grub."
+        warn "Add this to your bootloader's kernel line by hand:"
+        warn "    ${SPLASH_ARGS}"
+    fi
 
-        # spinner pins the watermark to the bottom edge (.96) because it treats
-        # it as a small distro badge. Centre it, and push the cube throbber down
-        # to .85 so the two don't overlap.
-        sed -i "s/^WatermarkVerticalAlignment=.*/WatermarkVerticalAlignment=.5/" "$THEME_FILE"
-        sed -i "s/^WatermarkHorizontalAlignment=.*/WatermarkHorizontalAlignment=.5/" "$THEME_FILE"
-        sed -i "s/^VerticalAlignment=.7$/VerticalAlignment=.85/" "$THEME_FILE"
+    # ---- activate ---------------------------------------------------------
+    # -R rebuilds the initramfs/UKI, which is what actually ships the theme.
+    # Editing /usr/share alone changes nothing at boot.
+    plymouth-set-default-theme -R "$SPLASH_THEME" \
+        || warn "plymouth-set-default-theme failed — the splash will not show"
 
-        if [[ "$SPLASH_ANIMATION" != "yes" ]]; then
-            # Logo on plain black. two-step tolerates missing frames — it logs
-            # "optional progress animation wouldn't load" and carries on.
-            rm -f "${THEME_DIR}"/animation-*.png "${THEME_DIR}"/throbber-*.png
-            echo "Animation ........... disabled (logo on black)"
-        else
-            echo "Animation ........... spinner cubes kept"
+    echo "Boot splash installed (theme '${SPLASH_THEME}', logo ${SPLASH_WIDTH}px wide)."
+fi
+
+# ============================================================================
+say "Installing devctl (SCUBE internal support CLI)"
+# devctl runs as root (admin's sudo), but everything it targets — the app's
+# SQLite files, its IPC socket, its log directory — lives under $KIOSK_USER,
+# a DIFFERENT account. None of that is auto-discoverable across the account
+# boundary, so this wires up exactly what devctl/README.md's "app runs under
+# its own account" section describes doing by hand, automatically, on every
+# device provisioned from this script.
+DEVCTL_SRC_BIN="${APP_DIR}/${DEVCTL_BINARY_REL}"
+if [[ ! -x "$DEVCTL_SRC_BIN" ]]; then
+    warn "devctl binary not found at $DEVCTL_SRC_BIN (check DEVCTL_BINARY_REL, and"
+    warn "that modbus_linux_bundle actually includes it) — skipping devctl setup."
+else
+    install -m 0755 "$DEVCTL_SRC_BIN" /usr/local/bin/devctl
+    echo "Installed /usr/local/bin/devctl."
+
+    if [[ -z "$DEVCTL_AUTHORIZED_KEYS" ]]; then
+        warn "DEVCTL_AUTHORIZED_KEYS is empty — devctl is installed but no SSH key can"
+        warn "use it yet. Set it up by hand later per devctl/README.md, or add keys to"
+        warn "this script and re-run (it only touches the auth file below, safe to redo)."
+    else
+        if ! grep -q '^ssh-' <<< "$DEVCTL_AUTHORIZED_KEYS"; then
+            warn "DEVCTL_AUTHORIZED_KEYS doesn't look like it contains real 'ssh-...' public"
+            warn "key lines — double-check it before relying on devctl access from this device."
         fi
 
-        # ---- images -------------------------------------------------------
-        # Alpha is flattened onto black EXPLICITLY: '-alpha remove' without a
-        # stated -background picks white, which is what makes a transparent
-        # logo come out wrong.
-        magick "$SPLASH_SRC" -resize "${SPLASH_WIDTH}x" \
-            -background black -alpha remove -alpha off -strip \
-            "${THEME_DIR}/watermark.png" \
-            || warn "watermark conversion failed — is ${SPLASH_LOGO} a valid image?"
+        DEVCTL_SUPPORT_DIR="${KIOSK_HOME}/.local/share/com.scube.hybridcontroller"
+        install -d -m 755 "$DEVCTL_SUPPORT_DIR"
+        printf '%s\n' "$DEVCTL_AUTHORIZED_KEYS" > "${DEVCTL_SUPPORT_DIR}/devctl_authorized_keys"
+        chmod 600 "${DEVCTL_SUPPORT_DIR}/devctl_authorized_keys"
+        chown -R "${KIOSK_USER}:${KIOSK_USER}" "$DEVCTL_SUPPORT_DIR"
 
-        # systemd-stub's splash must be 24-bit BMP3. 32-bit BMP or PNG is
-        # rejected, and it fails silently (no splash, no error).
-        magick -size "${FB_W}x${FB_H}" xc:black \
-            \( "$SPLASH_SRC" -resize "${SPLASH_WIDTH}x" -background black -alpha remove -alpha off \) \
-            -gravity center -composite \
-            -alpha off -type TrueColor -define bmp:format=bmp3 \
-            /boot/splash.bmp \
-            || warn "stub splash conversion failed"
-
-        # ---- mkinitcpio hook ----------------------------------------------
-        # Must sit immediately after udev (or after systemd, as sd-plymouth).
-        # Guarded so a re-run can't insert it twice.
-        if ! grep -q '^HOOKS=.*plymouth' /etc/mkinitcpio.conf; then
-            if grep -q '^HOOKS=(base systemd ' /etc/mkinitcpio.conf; then
-                sed -i 's/^HOOKS=(base systemd /HOOKS=(base systemd sd-plymouth /' /etc/mkinitcpio.conf
+        # /etc/environment is read by PAM for essentially any login path,
+        # sudo/sudo -i included — the same mechanism devctl/README.md uses.
+        # XDG_RUNTIME_DIR=/run/user/<uid> is guaranteed to exist here (not
+        # just on active login) because loginctl enable-linger already ran
+        # for $KIOSK_USER in STEP 9. If a future systemd/distro change ever
+        # makes this not match, `find /run/user -name solscada_ipc.sock`
+        # finds the real path — see devctl/README.md's troubleshooting table.
+        KIOSK_UID="$(id -u "$KIOSK_USER")"
+        for line in \
+            "SOLSCADA_SUPPORT_DIR=${DEVCTL_SUPPORT_DIR}" \
+            "SOLSCADA_IPC_SOCK=/run/user/${KIOSK_UID}/solscada_ipc.sock" \
+            "SOLSCADA_LOGS_DIR=${KIOSK_HOME}/Documents/ModbusLogs"
+        do
+            key="${line%%=*}"
+            if grep -q "^${key}=" /etc/environment 2>/dev/null; then
+                sed -i "s#^${key}=.*#${line}#" /etc/environment
             else
-                sed -i 's/^HOOKS=(base udev /HOOKS=(base udev plymouth /' /etc/mkinitcpio.conf
+                echo "$line" >> /etc/environment
             fi
-        fi
-        grep -q '^HOOKS=.*plymouth' /etc/mkinitcpio.conf \
-            || warn "Could not add the plymouth hook — fix HOOKS= in /etc/mkinitcpio.conf by hand"
+        done
 
-        # ---- kernel cmdline -----------------------------------------------
-        # plymouthd exits immediately unless 'splash' is on the cmdline, and
-        # 'quiet' is what stops kernel messages painting over the logo. WHERE
-        # this belongs depends on how the box boots, so detect it.
-        SPLASH_ARGS="quiet splash loglevel=3 rd.udev.log_level=3 vt.global_cursor_default=0 logo.nologo"
+        # Let admin's `sudo -E devctl ...` actually carry the forwarded SSH
+        # agent + the 3 vars above through, permanently — same env_keep
+        # pattern as the AUR build's TEMPORARY sudoers drop-in earlier in
+        # this script, but this one stays.
+        echo 'Defaults env_keep += "SSH_AUTH_SOCK SOLSCADA_SUPPORT_DIR SOLSCADA_IPC_SOCK SOLSCADA_LOGS_DIR"' \
+            > /etc/sudoers.d/devctl-env
+        chmod 440 /etc/sudoers.d/devctl-env
+        visudo -cf /etc/sudoers.d/devctl-env >/dev/null || die "devctl sudoers rule invalid"
 
-        if grep -qs '^default_uki=' /etc/mkinitcpio.d/linux.preset; then
-            echo "Boot type ........... unified kernel image (cmdline baked in)"
-            # seed from the running cmdline if the file doesn't exist yet
-            [[ -f /etc/kernel/cmdline ]] || tr -d '\n' < /proc/cmdline > /etc/kernel/cmdline
-            CMDLINE="$(tr -d '\n' < /etc/kernel/cmdline)"
-            for arg in $SPLASH_ARGS; do
-                grep -qw -- "${arg%%=*}" <<< "$CMDLINE" || CMDLINE="${CMDLINE} ${arg}"
-            done
-            printf '%s\n' "$CMDLINE" > /etc/kernel/cmdline
-            chmod 644 /etc/kernel/cmdline
-
-            # Point the UKI build at our splash. The preset ships a
-            # default_options with --splash aimed at Arch's stock logo, so
-            # REPLACE it — a second default_options line would just be
-            # overridden, since the preset is sourced as a shell script.
-            if grep -q '^default_options=' /etc/mkinitcpio.d/linux.preset; then
-                sed -i 's|^default_options=.*|default_options="--splash /boot/splash.bmp"|' \
-                    /etc/mkinitcpio.d/linux.preset
-            else
-                echo 'default_options="--splash /boot/splash.bmp"' >> /etc/mkinitcpio.d/linux.preset
-            fi
-            echo "cmdline ............. $CMDLINE"
-
-        elif [[ -f /etc/default/grub ]]; then
-            echo "Boot type ........... GRUB + separate initramfs"
-            for arg in $SPLASH_ARGS; do
-                grep -q "^GRUB_CMDLINE_LINUX_DEFAULT=.*${arg%%=*}" /etc/default/grub \
-                    || sed -i "s|^\(GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\)\"|\1 ${arg}\"|" \
-                       /etc/default/grub
-            done
-            # hand the same framebuffer to the kernel so the image survives
-            grep -q '^GRUB_GFXPAYLOAD_LINUX=' /etc/default/grub \
-                || echo 'GRUB_GFXPAYLOAD_LINUX=keep' >> /etc/default/grub
-            grub-mkconfig -o /boot/grub/grub.cfg || warn "grub-mkconfig failed"
-
-        else
-            warn "Found neither a UKI preset nor /etc/default/grub."
-            warn "Add this to your bootloader's kernel line by hand:"
-            warn "    ${SPLASH_ARGS}"
-        fi
-
-        # ---- activate -----------------------------------------------------
-        # -R rebuilds the initramfs/UKI, which is what actually ships the theme.
-        # Editing /usr/share alone changes nothing at boot.
-        plymouth-set-default-theme -R "$SPLASH_THEME" \
-            || warn "plymouth-set-default-theme failed — the splash will not show"
-
-        echo "Boot splash installed (theme '${SPLASH_THEME}', logo ${SPLASH_WIDTH}px wide)."
+        KEY_COUNT=$(grep -c '^ssh-' <<< "$DEVCTL_AUTHORIZED_KEYS" || true)
+        echo "devctl authorized for ${KEY_COUNT} key(s). Use it via: ssh -A ${ADMIN_USER}@<this-device>, then sudo -E devctl health"
     fi
 fi
 
@@ -885,9 +1043,10 @@ say "Installing the splash re-branding helper"
 cat > /usr/local/bin/set-splash <<'EOF'
 #!/usr/bin/env bash
 # Swap this kiosk's boot logo (plymouth watermark + systemd-stub splash).
-#   sudo set-splash /path/to/logo.png [width]
-# Defaults to the width baked in at install time. Rebuilds the initramfs/UKI,
-# so it takes ~20s. Previous images are kept in /var/backups/splash.
+#   sudo set-splash [/path/to/logo.png] [width]
+# With no arguments it re-reads the logo currently in the app bundle, which is
+# what kiosk-update-app calls after a deploy. Rebuilds the initramfs/UKI, so it
+# takes ~20s. Previous images are kept in /var/backups/splash.
 set -euo pipefail
 
 THEME="THEME_PLACEHOLDER"
@@ -901,9 +1060,8 @@ BACKUP_DIR="/var/backups/splash"
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[36m==>\033[0m %s\n' "$*"; }
 
-[[ $EUID -eq 0 ]] || die "run as root: sudo set-splash <image> [width]"
+[[ $EUID -eq 0 ]] || die "run as root: sudo set-splash [image] [width]"
 
-# default to the logo already in the app bundle when called with no argument
 SRC="${1:-${APP_DIR}/${SPLASH_LOGO}}"
 WIDTH="${2:-$DEFAULT_WIDTH}"
 
@@ -963,16 +1121,18 @@ APP_REPO="REPO_PLACEHOLDER"
 APP_DIR="APPDIR_PLACEHOLDER"
 APP_BINARY="BINARY_PLACEHOLDER"
 KIOSK_USER="KIOSKUSER_PLACEHOLDER"
+DEVCTL_BINARY_REL="DEVCTLBIN_PLACEHOLDER"
 SPLASH_LOGO="LOGO_PLACEHOLDER"
 BRANCH="${1:-BRANCH_PLACEHOLDER}"
 COMMIT="${2:-}"
 
 [[ -n "$APP_REPO" ]] || { echo "This kiosk was not deployed from git — nothing to update."; exit 1; }
 
-# remember the old logo so we only rebuild the splash if the new release
+# remember the old logo so the splash is only rebuilt when the new release
 # actually changed it (the rebuild costs ~20s, so skip it when pointless)
 OLD_LOGO_SUM=""
-[[ -f "${APP_DIR}/${SPLASH_LOGO}" ]] && OLD_LOGO_SUM=$(sha256sum "${APP_DIR}/${SPLASH_LOGO}" | cut -d' ' -f1)
+[[ -n "$SPLASH_LOGO" && -f "${APP_DIR}/${SPLASH_LOGO}" ]] \
+  && OLD_LOGO_SUM=$(sha256sum "${APP_DIR}/${SPLASH_LOGO}" | cut -d' ' -f1)
 
 TMP="$(mktemp -d)"
 echo "==> cloning $APP_REPO (branch: $BRANCH)"
@@ -999,6 +1159,13 @@ rm -rf "$APP_DIR/.git" "$TMP"
 chown -R root:root "$APP_DIR"; chmod -R 755 "$APP_DIR"
 chmod +x "${APP_DIR}/${APP_BINARY}" 2>/dev/null || true
 
+# devctl ships in the same bundle, so a deploy can bring a new one. Refresh the
+# installed copy; auth (keys, /etc/environment, sudoers) is untouched.
+if [[ -n "$DEVCTL_BINARY_REL" && -x "${APP_DIR}/${DEVCTL_BINARY_REL}" ]]; then
+    install -m 0755 "${APP_DIR}/${DEVCTL_BINARY_REL}" /usr/local/bin/devctl
+    echo "==> refreshed /usr/local/bin/devctl from this release"
+fi
+
 echo "==> starting app"
 su - "$KIOSK_USER" -c 'systemctl --user start kiosk-app.service' 2>/dev/null \
   || systemctl --user -M "${KIOSK_USER}@" start kiosk-app.service 2>/dev/null || true
@@ -1008,7 +1175,7 @@ if [[ -n "$SPLASH_LOGO" && -f "${APP_DIR}/${SPLASH_LOGO}" ]] && command -v set-s
     NEW_LOGO_SUM=$(sha256sum "${APP_DIR}/${SPLASH_LOGO}" | cut -d' ' -f1)
     if [[ "$NEW_LOGO_SUM" != "$OLD_LOGO_SUM" ]]; then
         echo "==> ${SPLASH_LOGO} changed in this release — refreshing the boot splash"
-        set-splash "${APP_DIR}/${SPLASH_LOGO}" || echo "!!  splash refresh failed (app is fine)"
+        set-splash "${APP_DIR}/${SPLASH_LOGO}" || echo "!!  splash refresh failed (the app itself is fine)"
     else
         echo "==> boot logo unchanged — splash left alone"
     fi
@@ -1016,11 +1183,12 @@ fi
 
 echo "Updated to $BRANCH @ $REF.  Previous version kept at ${APP_DIR}.old"
 EOF
-sed -i "s#REPO_PLACEHOLDER#${APP_REPO}#"        /usr/local/bin/kiosk-update-app
-sed -i "s#APPDIR_PLACEHOLDER#${APP_DIR}#"       /usr/local/bin/kiosk-update-app
-sed -i "s#BINARY_PLACEHOLDER#${APP_BINARY}#"    /usr/local/bin/kiosk-update-app
-sed -i "s#KIOSKUSER_PLACEHOLDER#${KIOSK_USER}#" /usr/local/bin/kiosk-update-app
-sed -i "s#LOGO_PLACEHOLDER#${SPLASH_LOGO}#"     /usr/local/bin/kiosk-update-app
+sed -i "s#REPO_PLACEHOLDER#${APP_REPO}#"           /usr/local/bin/kiosk-update-app
+sed -i "s#APPDIR_PLACEHOLDER#${APP_DIR}#"          /usr/local/bin/kiosk-update-app
+sed -i "s#BINARY_PLACEHOLDER#${APP_BINARY}#"       /usr/local/bin/kiosk-update-app
+sed -i "s#KIOSKUSER_PLACEHOLDER#${KIOSK_USER}#"    /usr/local/bin/kiosk-update-app
+sed -i "s#DEVCTLBIN_PLACEHOLDER#${DEVCTL_BINARY_REL}#" /usr/local/bin/kiosk-update-app
+sed -i "s#LOGO_PLACEHOLDER#${SPLASH_LOGO}#"        /usr/local/bin/kiosk-update-app
 sed -i "s#BRANCH_PLACEHOLDER#${APP_BRANCH:-main}#" /usr/local/bin/kiosk-update-app
 chmod 755 /usr/local/bin/kiosk-update-app
 chown root:root /usr/local/bin/kiosk-update-app
@@ -1108,6 +1276,20 @@ chown root:root /usr/local/bin/first-setup
 
 # ============================================================================
 say "DONE. Summary:"
+if [[ ! -x /usr/local/bin/devctl ]]; then
+    DEVCTL_STATUS="not installed (binary missing from the bundle — see the devctl step's warning above)"
+elif [[ -z "$DEVCTL_AUTHORIZED_KEYS" ]]; then
+    DEVCTL_STATUS="installed, but NO key authorized yet — see devctl/README.md"
+else
+    DEVCTL_STATUS="installed, $(grep -c '^ssh-' <<< "$DEVCTL_AUTHORIZED_KEYS" || true) key(s) authorized"
+fi
+if [[ -z "$SPLASH_LOGO" ]]; then
+    SPLASH_STATUS="disabled (SPLASH_LOGO empty)"
+elif [[ -f "/usr/share/plymouth/themes/${SPLASH_THEME}/watermark.png" ]]; then
+    SPLASH_STATUS="theme '${SPLASH_THEME}', ${SPLASH_WIDTH}px logo, '${SPLASH_STYLE}' indicator"
+else
+    SPLASH_STATUS="NOT installed — see the STEP 15 warning above"
+fi
 cat <<EOF
 
   Kiosk user .......... ${KIOSK_USER}  (no sudo, autologin on tty1)
@@ -1122,10 +1304,9 @@ cat <<EOF
   GPIO ................ module '${GPIO_MODULE}' (loads at boot)
                         udev: /dev/gpiochip* -> root:${GPIO_GROUP} 0660
                         terminals 1-8 = gpiochip0 lines 48-55
-  Boot splash ......... plymouth theme '${SPLASH_THEME}'
-                        logo from ${APP_DIR}/${SPLASH_LOGO} at ${SPLASH_WIDTH}px
-                        stub splash /boot/splash.bmp (shown by systemd-stub)
-                        re-brand later with:  sudo set-splash [image] [width]
+  Boot splash ......... ${SPLASH_STATUS}
+                        logo read from ${APP_DIR}/${SPLASH_LOGO}
+                        stub splash /boot/splash.bmp (systemd-stub draws it)
   F12 menu ............ Restart App | Reboot System   (nothing else)
   Ctrl+Alt+C .......... Chrome
   Ctrl+Alt+R .......... RustDesk
@@ -1140,6 +1321,8 @@ cat <<EOF
   kiosk-update-app .... /usr/local/bin/kiosk-update-app  (re-deploy another branch)
   kiosk-gpio-check .... /usr/local/bin/kiosk-gpio-check  (diagnose dead digital IO)
   set-splash .......... /usr/local/bin/set-splash        (change the boot logo)
+  devctl .............. ${DEVCTL_STATUS}
+                        use via: ssh -A ${ADMIN_USER}@<this-device>, then sudo -E devctl health
 
   NEXT:
     1) reboot
@@ -1151,10 +1334,16 @@ cat <<EOF
               sudo -u ${KIOSK_USER} ngpio show    (must work WITHOUT sudo)
     6) splash: watch the boot — the logo should be centred on black. If it is
               missing:  journalctl -b -u plymouth-start.service
+              With the 'bar' style the first boot has no timing baseline, so
+              the bar only paces correctly from the SECOND boot onward.
     7) to STOP the app for maintenance: open a Terminal (password required),
        then:  systemctl --user stop kiosk-app.service
     8) to deploy a new branch later:  sudo kiosk-update-app <branch>
-    9) (optional hardening, do LAST) block TTY switching:
+    9) devctl: ssh -A ${ADMIN_USER}@<device>, then sudo -E devctl health — should
+       print "devctl: authenticated as ..." then real output. See
+       devctl/README.md if it doesn't (SSH_AUTH_SOCK / no authorized key /
+       daemon unreachable are all covered in its troubleshooting table).
+   10) (optional hardening, do LAST) block TTY switching:
          create /etc/X11/xorg.conf.d/10-kiosk.conf with DontVTSwitch/DontZap
 
 EOF
