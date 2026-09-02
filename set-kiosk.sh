@@ -44,6 +44,9 @@
 #   The boot logo is taken from the app bundle ($APP_DIR/$SPLASH_LOGO), so a
 #   new app release re-brands the boot screen with no change to this script.
 #   Re-brand an already-provisioned device with:  sudo set-splash
+#   NOTE: STEP 15 rebuilds the theme from scratch every run, so any hand
+#   tuning done directly in /usr/share/plymouth/themes/$SPLASH_THEME is lost
+#   on the next run. Put changes in the config block below instead.
 #
 # ---------------------------------------------------------------------------
 # devctl (remote support/admin CLI — GPIO config, device/formula/SLD edits,
@@ -121,13 +124,20 @@ SPLASH_THEME="mylogo"       # plymouth theme name (derived from 'spinner')
 SPLASH_WIDTH="400"          # rendered logo width in px; keep <= half the panel
 
 # Loading indicator shown under the logo while booting:
-#   "cubes" — plymouth's spinner cube animation (stock)
-#   "bar"   — thin progress bar; no image files, cleanest on a panel PC
-#   "dots"  — three pulsing dots, generated in SPLASH_ACCENT below
-#   "none"  — logo on black, no indicator at all
-SPLASH_STYLE="bar"
+#   "spinfinity" — infinity-loop throbber from plymouth's spinfinity theme
+#   "cubes"      — plymouth's stock spinner throbber (a small circular spinner)
+#   "bar"        — thin progress bar; no image files, tracks real boot progress
+#   "dots"       — three pulsing dots, generated in SPLASH_ACCENT below
+#   "none"       — logo on black, no indicator at all
+SPLASH_STYLE="spinfinity"
 
-# Accent colour for the "bar" and "dots" styles. Hex, no alpha.
+# Vertical position of the indicator, 0 = top of screen, 1 = bottom. Each style
+# sets a sensible default; override here if the indicator collides with a tall
+# logo. The watermark (your logo) always sits centred at .5.
+SPLASH_INDICATOR_POS=""     # e.g. ".65" — leave "" to use the style's default
+
+# Accent colour for the "bar" and "dots" styles. Hex, no alpha. Ignored by the
+# spinfinity and cubes styles, whose frames are pre-rendered PNGs.
 SPLASH_ACCENT="#00a3e0"
 
 # ---- devctl (SCUBE internal support/admin CLI) ------------------------------
@@ -803,7 +813,8 @@ else
     # ---- theme ------------------------------------------------------------
     # Derived from 'spinner' so its keymap/lock/entry assets come along; only
     # the watermark is swapped. Rebuilt from scratch each run so a re-run can't
-    # leave a half-edited theme behind.
+    # leave a half-edited theme behind — which also means hand edits under
+    # /usr/share/plymouth/themes/$SPLASH_THEME do NOT survive a re-run.
     THEME_DIR="/usr/share/plymouth/themes/${SPLASH_THEME}"
     rm -rf "$THEME_DIR"
     cp -r /usr/share/plymouth/themes/spinner "$THEME_DIR"
@@ -812,11 +823,11 @@ else
     sed -i "s/^Name=.*/Name=${SPLASH_THEME}/; s|spinner|${SPLASH_THEME}|g" "$THEME_FILE"
 
     # spinner pins the watermark to the bottom edge (.96) because it treats it
-    # as a small distro badge. Centre it, and push the throbber down to .85 so
-    # the two don't overlap.
-    sed -i "s/^WatermarkVerticalAlignment=.*/WatermarkVerticalAlignment=.5/"   "$THEME_FILE"
+    # as a small distro badge. Centre it; each indicator style then sets its own
+    # VerticalAlignment below so the two don't overlap.
+    sed -i "s/^WatermarkVerticalAlignment=.*/WatermarkVerticalAlignment=.5/"     "$THEME_FILE"
     sed -i "s/^WatermarkHorizontalAlignment=.*/WatermarkHorizontalAlignment=.5/" "$THEME_FILE"
-    sed -i "s/^VerticalAlignment=.7$/VerticalAlignment=.85/"                   "$THEME_FILE"
+    sed -i "s/^HorizontalAlignment=.*/HorizontalAlignment=.5/"                   "$THEME_FILE"
 
     # ---- images -----------------------------------------------------------
     # Alpha is flattened onto black EXPLICITLY: '-alpha remove' without a
@@ -837,24 +848,64 @@ else
         || warn "stub splash conversion failed"
 
     # ---- loading indicator ------------------------------------------------
-    # two-step can draw either a frame sequence (throbber-*.png, looped at
-    # ~30fps) or a progress bar, or nothing at all.
+    # two-step draws the progress animation (progress-*.png, paced by real boot
+    # progress), the throbber (throbber-*.png, a fixed-rate loop) and the drawn
+    # progress bar INDEPENDENTLY. If more than one is present you get more than
+    # one indicator on screen, so every branch clears all three first.
+    #
+    # The globs are deliberately un-hyphenated: spinfinity ships two-digit
+    # names (throbber-18.png) while generated frames use four (throbber-0018.png),
+    # and plymouth sorts the glob lexically — a leftover set from a different
+    # style interleaves with the new one and the two indicators alternate.
+    clear_indicators() {
+        rm -f "${THEME_DIR}"/throbber*.png \
+              "${THEME_DIR}"/progress*.png \
+              "${THEME_DIR}"/animation*.png
+    }
+
+    # Per-style default position; SPLASH_INDICATOR_POS overrides it if set.
+    set_indicator_pos() {
+        local pos="${SPLASH_INDICATOR_POS:-$1}"
+        sed -i "s/^VerticalAlignment=.*/VerticalAlignment=${pos}/" "$THEME_FILE"
+        echo "Indicator position .. ${pos}"
+    }
+
     case "$SPLASH_STYLE" in
+      spinfinity)
+        clear_indicators
+        if [[ -d /usr/share/plymouth/themes/spinfinity ]] \
+           && compgen -G "/usr/share/plymouth/themes/spinfinity/throbber-*.png" >/dev/null; then
+            cp /usr/share/plymouth/themes/spinfinity/throbber-*.png "$THEME_DIR"/
+            chmod 644 "${THEME_DIR}"/throbber-*.png
+            # .6 keeps the loop clear of a centred logo; spinfinity's own frames
+            # are wider than spinner's, so .85 sits too low and looks detached.
+            set_indicator_pos ".6"
+            echo "Indicator ........... spinfinity infinity loop ($(ls "${THEME_DIR}"/throbber-*.png | wc -l) frames)"
+        else
+            warn "spinfinity theme not installed — no indicator will be shown."
+            warn "The logo will still appear. Set SPLASH_STYLE=bar for a file-free option."
+        fi
+        ;;
+
       cubes)
-        echo "Indicator ........... spinner cubes (stock frames)"
+        # Keep spinner's own throbber frames (a small circular spinner) exactly
+        # as shipped — they came along with the cp -r above, so nothing to do
+        # but position them.
+        set_indicator_pos ".7"
+        echo "Indicator ........... spinner stock throbber"
         ;;
 
       bar)
         # No image files needed — two-step draws the bar itself. Geometry and
         # colour live in [two-step], but UseProgressBar is read PER BOOT MODE,
         # so it has to go under [boot-up] or it is silently ignored.
-        rm -f "${THEME_DIR}"/animation-*.png "${THEME_DIR}"/throbber-*.png
+        clear_indicators
         BAR_W=$(( FB_W / 3 ))
         BAR_FG="0x${SPLASH_ACCENT#\#}"
         sed -i "s/^ProgressBarForegroundColor=.*/ProgressBarForegroundColor=${BAR_FG}/" "$THEME_FILE"
         sed -i "s/^ProgressBarBackgroundColor=.*/ProgressBarBackgroundColor=0x303030/"  "$THEME_FILE"
         grep -q '^ProgressBarWidth=' "$THEME_FILE" || \
-          sed -i "/^\[two-step\]/a ProgressBarWidth=${BAR_W}\nProgressBarHeight=4\nProgressBarHorizontalAlignment=.5\nProgressBarVerticalAlignment=.62" "$THEME_FILE"
+          sed -i "/^\[two-step\]/a ProgressBarWidth=${BAR_W}\nProgressBarHeight=4\nProgressBarHorizontalAlignment=.5\nProgressBarVerticalAlignment=${SPLASH_INDICATOR_POS:-.62}" "$THEME_FILE"
         grep -q '^UseProgressBar=true' "$THEME_FILE" || \
           sed -i "/^\[boot-up\]/a UseProgressBar=true" "$THEME_FILE"
         echo "Indicator ........... progress bar (${BAR_W}x4, ${SPLASH_ACCENT})"
@@ -864,8 +915,8 @@ else
         # Three dots with the lit one cycling. 10 held frames per state gives a
         # ~1s loop at plymouth's ~30fps, which reads as a pulse rather than a
         # flicker. Fewer frames looks frantic.
-        rm -f "${THEME_DIR}"/animation-*.png "${THEME_DIR}"/throbber-*.png
-        DOTS=3; HOLD=10; FW=140; FH=28; SPACING=40; RADIUS=6
+        clear_indicators
+        DOTS=3; HOLD=10; DFW=140; DFH=28; SPACING=40; RADIUS=6
         frame=1
         for (( active=0; active<DOTS; active++ )); do
             # build one image, then copy it HOLD times — far cheaper than
@@ -873,14 +924,14 @@ else
             TMP_FRAME="$(mktemp --suffix=.png)"
             DRAW=()
             for (( d=0; d<DOTS; d++ )); do
-                cx=$(( (FW - (DOTS-1)*SPACING)/2 + d*SPACING ))
+                cx=$(( (DFW - (DOTS-1)*SPACING)/2 + d*SPACING ))
                 if (( d == active )); then
-                    DRAW+=( -fill "$SPLASH_ACCENT" -draw "circle ${cx},$((FH/2)) $((cx+RADIUS)),$((FH/2))" )
+                    DRAW+=( -fill "$SPLASH_ACCENT" -draw "circle ${cx},$((DFH/2)) $((cx+RADIUS)),$((DFH/2))" )
                 else
-                    DRAW+=( -fill "#404040" -draw "circle ${cx},$((FH/2)) $((cx+RADIUS-2)),$((FH/2))" )
+                    DRAW+=( -fill "#404040" -draw "circle ${cx},$((DFH/2)) $((cx+RADIUS-2)),$((DFH/2))" )
                 fi
             done
-            magick -size "${FW}x${FH}" xc:black "${DRAW[@]}" -alpha off "$TMP_FRAME" \
+            magick -size "${DFW}x${DFH}" xc:black "${DRAW[@]}" -alpha off "$TMP_FRAME" \
                 || warn "dot frame generation failed"
             for (( h=0; h<HOLD; h++ )); do
                 cp "$TMP_FRAME" "$(printf '%s/throbber-%04d.png' "$THEME_DIR" "$frame")"
@@ -888,16 +939,20 @@ else
             done
             rm -f "$TMP_FRAME"
         done
+        chmod 644 "${THEME_DIR}"/throbber-*.png
+        set_indicator_pos ".7"
         echo "Indicator ........... $((frame-1)) generated dot frames (${SPLASH_ACCENT})"
         ;;
 
       none)
-        rm -f "${THEME_DIR}"/animation-*.png "${THEME_DIR}"/throbber-*.png
+        clear_indicators
         echo "Indicator ........... none (logo on black)"
         ;;
 
       *)
-        warn "Unknown SPLASH_STYLE '${SPLASH_STYLE}' — keeping the stock cubes."
+        warn "Unknown SPLASH_STYLE '${SPLASH_STYLE}' — falling back to spinner's"
+        warn "stock throbber. Valid values: spinfinity cubes bar dots none"
+        set_indicator_pos ".7"
         ;;
     esac
 
@@ -1045,8 +1100,10 @@ cat > /usr/local/bin/set-splash <<'EOF'
 # Swap this kiosk's boot logo (plymouth watermark + systemd-stub splash).
 #   sudo set-splash [/path/to/logo.png] [width]
 # With no arguments it re-reads the logo currently in the app bundle, which is
-# what kiosk-update-app calls after a deploy. Rebuilds the initramfs/UKI, so it
-# takes ~20s. Previous images are kept in /var/backups/splash.
+# what kiosk-update-app calls after a deploy. Only the LOGO changes — the
+# loading indicator is left exactly as setup-kiosk.sh configured it.
+# Rebuilds the initramfs/UKI, so it takes ~20s. Previous images are kept in
+# /var/backups/splash.
 set -euo pipefail
 
 THEME="THEME_PLACEHOLDER"
@@ -1307,6 +1364,8 @@ cat <<EOF
   Boot splash ......... ${SPLASH_STATUS}
                         logo read from ${APP_DIR}/${SPLASH_LOGO}
                         stub splash /boot/splash.bmp (systemd-stub draws it)
+                        theme is REBUILT each run — tune via the config block,
+                        not by editing /usr/share/plymouth/themes/${SPLASH_THEME}
   F12 menu ............ Restart App | Reboot System   (nothing else)
   Ctrl+Alt+C .......... Chrome
   Ctrl+Alt+R .......... RustDesk
@@ -1320,7 +1379,7 @@ cat <<EOF
   first-setup ......... /usr/local/bin/first-setup       (run once per cloned device)
   kiosk-update-app .... /usr/local/bin/kiosk-update-app  (re-deploy another branch)
   kiosk-gpio-check .... /usr/local/bin/kiosk-gpio-check  (diagnose dead digital IO)
-  set-splash .......... /usr/local/bin/set-splash        (change the boot logo)
+  set-splash .......... /usr/local/bin/set-splash        (change the boot logo only)
   devctl .............. ${DEVCTL_STATUS}
                         use via: ssh -A ${ADMIN_USER}@<this-device>, then sudo -E devctl health
 
@@ -1332,10 +1391,13 @@ cat <<EOF
     4) RS485: Settings -> RS485 -> enter port/baud/parity for this device
     5) GPIO:  sudo kiosk-gpio-check     (every line should say OK)
               sudo -u ${KIOSK_USER} ngpio show    (must work WITHOUT sudo)
-    6) splash: watch the boot — the logo should be centred on black. If it is
-              missing:  journalctl -b -u plymouth-start.service
-              With the 'bar' style the first boot has no timing baseline, so
-              the bar only paces correctly from the SECOND boot onward.
+    6) splash: watch the boot — the logo should be centred on black with ONE
+              indicator below it. If it is missing:
+                journalctl -b -u plymouth-start.service
+              To preview a tweak without rebooting:
+                plymouthd --debug --debug-file=/tmp/ply.log --tty=/dev/tty2
+                plymouth --show-splash; sleep 5; plymouth --quit
+                grep -iE 'watermark|throbber|progress' /tmp/ply.log
     7) to STOP the app for maintenance: open a Terminal (password required),
        then:  systemctl --user stop kiosk-app.service
     8) to deploy a new branch later:  sudo kiosk-update-app <branch>
