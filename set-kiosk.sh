@@ -701,7 +701,23 @@ else
         ;;
     esac
 
-    # plymouth hook, immediately after udev (or after systemd, as sd-plymouth).
+    SPLASH_THEME_BUILT=1
+fi   # <- end of the splash-image conditional
+
+# ============================================================================
+# Bootloader and initramfs config — deliberately OUTSIDE the conditional above.
+#
+# This USED to be nested inside it, which was a bug: if logo.png was missing
+# from the app bundle, STEP 8 bailed out early and the GRUB menu was never
+# hidden. Hiding the boot menu has nothing to do with whether a logo exists, so
+# it must not be gated behind one. Found the hard way on a provisioned panel
+# that kept showing the GRUB menu after a clean reset + re-provision.
+say "STEP 8/8 (cont.)  Bootloader and initramfs"
+
+# The plymouth hook is only useful if plymouth will actually draw something,
+# but it is harmless otherwise and the boot args below reference it, so add it
+# whenever plymouth is installed at all.
+if command -v plymouthd >/dev/null; then
     if ! grep -q '^HOOKS=.*plymouth' /etc/mkinitcpio.conf; then
         if grep -q '^HOOKS=(base systemd ' /etc/mkinitcpio.conf; then
             sed -i 's/^HOOKS=(base systemd /HOOKS=(base systemd sd-plymouth /' /etc/mkinitcpio.conf
@@ -711,64 +727,74 @@ else
     fi
     grep -q '^HOOKS=.*plymouth' /etc/mkinitcpio.conf \
         || warn "Could not add the plymouth hook — fix HOOKS= by hand"
+fi
 
-    # plymouthd exits immediately without 'splash' on the cmdline; 'quiet'
-    # stops kernel messages painting over the logo. Where this belongs depends
-    # on how the box boots, so detect rather than guess.
-    SPLASH_ARGS="quiet splash loglevel=3 rd.udev.log_level=3 vt.global_cursor_default=0 logo.nologo"
+# plymouthd exits immediately without 'splash' on the cmdline; 'quiet'
+# stops kernel messages painting over the logo. Where this belongs depends
+# on how the box boots, so detect rather than guess.
+SPLASH_ARGS="quiet splash loglevel=3 rd.udev.log_level=3 vt.global_cursor_default=0 logo.nologo"
 
-    if grep -qs '^default_uki=' /etc/mkinitcpio.d/linux.preset; then
-        echo "Boot type ........... unified kernel image"
-        [[ -f /etc/kernel/cmdline ]] || tr -d '\n' < /proc/cmdline > /etc/kernel/cmdline
-        CMDLINE="$(tr -d '\n' < /etc/kernel/cmdline)"
-        for arg in $SPLASH_ARGS; do
-            grep -qw -- "${arg%%=*}" <<< "$CMDLINE" || CMDLINE="${CMDLINE} ${arg}"
-        done
-        printf '%s\n' "$CMDLINE" > /etc/kernel/cmdline
-        chmod 644 /etc/kernel/cmdline
-        # The preset ships default_options with --splash pointing at Arch's own
-        # logo, so REPLACE it — the preset is sourced as a shell script and the
-        # last assignment wins, so a second line would just be overridden.
-        if grep -q '^default_options=' /etc/mkinitcpio.d/linux.preset; then
-            sed -i 's|^default_options=.*|default_options="--splash /boot/splash.bmp"|' \
-                /etc/mkinitcpio.d/linux.preset
-        else
-            echo 'default_options="--splash /boot/splash.bmp"' >> /etc/mkinitcpio.d/linux.preset
-        fi
-        echo "cmdline ............. $CMDLINE"
-
-    elif [[ -f /etc/default/grub ]]; then
-        echo "Boot type ........... GRUB + separate initramfs"
-        for arg in $SPLASH_ARGS; do
-            grep -q "^GRUB_CMDLINE_LINUX_DEFAULT=.*${arg%%=*}" /etc/default/grub \
-                || sed -i "s|^\(GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\)\"|\1 ${arg}\"|" \
-                   /etc/default/grub
-        done
-        grep -q '^GRUB_GFXPAYLOAD_LINUX=' /etc/default/grub \
-            || echo 'GRUB_GFXPAYLOAD_LINUX=keep' >> /etc/default/grub
-
-        # A fresh Arch install ships GRUB_TIMEOUT=5 with a visible menu, which
-        # is what put a GRUB screen in front of the splash on the first
-        # provisioned device. sed-in-place, not append: this file is SOURCED,
-        # so the last assignment wins and an appended line gets overridden.
-        grep -q '^GRUB_TIMEOUT=' /etc/default/grub \
-            && sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=0/' /etc/default/grub \
-            || echo 'GRUB_TIMEOUT=0' >> /etc/default/grub
-        grep -q '^GRUB_TIMEOUT_STYLE=' /etc/default/grub \
-            && sed -i 's/^GRUB_TIMEOUT_STYLE=.*/GRUB_TIMEOUT_STYLE=hidden/' /etc/default/grub \
-            || echo 'GRUB_TIMEOUT_STYLE=hidden' >> /etc/default/grub
-        echo "GRUB menu ........... hidden, timeout 0 (hold Shift to force it)"
-
-        grub-mkconfig -o /boot/grub/grub.cfg || warn "grub-mkconfig failed"
+if grep -qs '^default_uki=' /etc/mkinitcpio.d/linux.preset; then
+    echo "Boot type ........... unified kernel image"
+    [[ -f /etc/kernel/cmdline ]] || tr -d '\n' < /proc/cmdline > /etc/kernel/cmdline
+    CMDLINE="$(tr -d '\n' < /etc/kernel/cmdline)"
+    for arg in $SPLASH_ARGS; do
+        grep -qw -- "${arg%%=*}" <<< "$CMDLINE" || CMDLINE="${CMDLINE} ${arg}"
+    done
+    printf '%s\n' "$CMDLINE" > /etc/kernel/cmdline
+    chmod 644 /etc/kernel/cmdline
+    # The preset ships default_options with --splash pointing at Arch's own
+    # logo, so REPLACE it — the preset is sourced as a shell script and the
+    # last assignment wins, so a second line would just be overridden.
+    if grep -q '^default_options=' /etc/mkinitcpio.d/linux.preset; then
+        sed -i 's|^default_options=.*|default_options="--splash /boot/splash.bmp"|' \
+            /etc/mkinitcpio.d/linux.preset
     else
-        warn "Neither a UKI preset nor /etc/default/grub found."
-        warn "Add by hand to your bootloader's kernel line: ${SPLASH_ARGS}"
+        echo 'default_options="--splash /boot/splash.bmp"' >> /etc/mkinitcpio.d/linux.preset
     fi
+    echo "cmdline ............. $CMDLINE"
+
+elif [[ -f /etc/default/grub ]]; then
+    echo "Boot type ........... GRUB + separate initramfs"
+    for arg in $SPLASH_ARGS; do
+        grep -q "^GRUB_CMDLINE_LINUX_DEFAULT=.*${arg%%=*}" /etc/default/grub \
+            || sed -i "s|^\(GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\)\"|\1 ${arg}\"|" \
+               /etc/default/grub
+    done
+    grep -q '^GRUB_GFXPAYLOAD_LINUX=' /etc/default/grub \
+        || echo 'GRUB_GFXPAYLOAD_LINUX=keep' >> /etc/default/grub
+
+    # A fresh Arch install ships GRUB_TIMEOUT=5 with a visible menu, which
+    # is what put a GRUB screen in front of the splash on the first
+    # provisioned device. sed-in-place, not append: this file is SOURCED,
+    # so the last assignment wins and an appended line gets overridden.
+    grep -q '^GRUB_TIMEOUT=' /etc/default/grub \
+        && sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=0/' /etc/default/grub \
+        || echo 'GRUB_TIMEOUT=0' >> /etc/default/grub
+    grep -q '^GRUB_TIMEOUT_STYLE=' /etc/default/grub \
+        && sed -i 's/^GRUB_TIMEOUT_STYLE=.*/GRUB_TIMEOUT_STYLE=hidden/' /etc/default/grub \
+        || echo 'GRUB_TIMEOUT_STYLE=hidden' >> /etc/default/grub
+    echo "GRUB menu ........... hidden, timeout 0 (hold Shift to force it)"
+
+    grub-mkconfig -o /boot/grub/grub.cfg || warn "grub-mkconfig failed"
+else
+    warn "Neither a UKI preset nor /etc/default/grub found."
+    warn "Add by hand to your bootloader's kernel line: ${SPLASH_ARGS}"
+fi
 
     # -R rebuilds the initramfs/UKI, which is what actually ships the theme.
+    # Only meaningful if the theme was built above; otherwise mkinitcpio still
+    # needs running so the HOOKS/cmdline changes land.
+if [[ "${SPLASH_THEME_BUILT:-0}" == "1" ]]; then
     plymouth-set-default-theme -R "$SPLASH_THEME" \
         || warn "plymouth-set-default-theme failed — the splash will not show"
     echo "Boot splash installed (theme '${SPLASH_THEME}')."
+else
+    warn "No custom splash theme was built (see the warning above), but the"
+    warn "bootloader config WAS applied. Rebuilding the initramfs anyway so the"
+    warn "HOOKS and cmdline changes take effect."
+    mkinitcpio -P >/dev/null 2>&1 && echo "initramfs rebuilt" \
+        || warn "mkinitcpio -P failed"
 fi
 
 # ============================================================================
