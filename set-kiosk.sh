@@ -763,23 +763,41 @@ elif [[ -f /etc/default/grub ]]; then
     done
     grep -q '^GRUB_GFXPAYLOAD_LINUX=' /etc/default/grub \
         || echo 'GRUB_GFXPAYLOAD_LINUX=keep' >> /etc/default/grub
-
-    # A fresh Arch install ships GRUB_TIMEOUT=5 with a visible menu, which
-    # is what put a GRUB screen in front of the splash on the first
-    # provisioned device. sed-in-place, not append: this file is SOURCED,
-    # so the last assignment wins and an appended line gets overridden.
-    grep -q '^GRUB_TIMEOUT=' /etc/default/grub \
-        && sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=0/' /etc/default/grub \
-        || echo 'GRUB_TIMEOUT=0' >> /etc/default/grub
-    grep -q '^GRUB_TIMEOUT_STYLE=' /etc/default/grub \
-        && sed -i 's/^GRUB_TIMEOUT_STYLE=.*/GRUB_TIMEOUT_STYLE=hidden/' /etc/default/grub \
-        || echo 'GRUB_TIMEOUT_STYLE=hidden' >> /etc/default/grub
-    echo "GRUB menu ........... hidden, timeout 0 (hold Shift to force it)"
+    # NOTE: menu timeout is NOT set here — see the unconditional block below.
+    # Doing it here would miss GRUB->UKI machines, which take the branch above.
 
     grub-mkconfig -o /boot/grub/grub.cfg || warn "grub-mkconfig failed"
 else
     warn "Neither a UKI preset nor /etc/default/grub found."
     warn "Add by hand to your bootloader's kernel line: ${SPLASH_ARGS}"
+fi
+
+# ---- Hide the GRUB menu — UNCONDITIONAL, not part of the if/elif above ----
+#
+# This is separate on purpose. These panels boot GRUB -> UKI: /etc/default/grub
+# AND a default_uki= preset both exist. The cmdline block above is an if/elif,
+# so a UKI machine takes the first branch and never reaches the GRUB code — the
+# menu stayed visible through a full reset + re-provision because of exactly
+# that. Menu timeout has nothing to do with which mechanism carries the
+# cmdline, so it gets its own unconditional block.
+#
+# Delete-then-append rather than sed-in-place: /etc/default/grub is SOURCED, so
+# the LAST assignment wins. Hand-edited files on these panels ended up with two
+# GRUB_TIMEOUT lines; deleting every copy first makes the result the same no
+# matter what state the file was in.
+if [[ -f /etc/default/grub ]]; then
+    sed -i '/^GRUB_TIMEOUT=/d; /^GRUB_TIMEOUT_STYLE=/d' /etc/default/grub
+    printf 'GRUB_TIMEOUT=0\nGRUB_TIMEOUT_STYLE=hidden\n' >> /etc/default/grub
+
+    if grub-mkconfig -o /boot/grub/grub.cfg >/dev/null 2>&1; then
+        echo "GRUB menu ........... hidden, timeout 0 (hold Shift to force it)"
+    else
+        warn "grub-mkconfig failed — the menu may still appear."
+    fi
+
+    # Print what actually landed. A silent 'success' here is how this went
+    # unnoticed for three provisioning cycles.
+    grep -E '^GRUB_(TIMEOUT|TIMEOUT_STYLE)=' /etc/default/grub | sed 's/^/                        /'
 fi
 
     # -R rebuilds the initramfs/UKI, which is what actually ships the theme.
